@@ -2,15 +2,18 @@ import { Fragment, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ExternalLink, Loader2, Search, Sparkles, Trash2 } from "lucide-react";
 import { backend } from "@/lib/backend";
+import { refreshAfterCleanup } from "@/lib/refresh";
 import { formatBytes } from "@/lib/utils";
 import type { AppUsage, InstalledApp, Leftover } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { ConfirmDeleteModal, type DeleteItem } from "@/components/ConfirmDeleteModal";
+import { AppLogo } from "@/components/AppLogo";
 
 function UninstallPanel({ app, onClose }: { app: InstalledApp; onClose: () => void }) {
   const queryClient = useQueryClient();
   const [launched, setLaunched] = useState(false);
+  const [launching, setLaunching] = useState(false);
   const [scanning, setScanning] = useState(false);
   const [leftovers, setLeftovers] = useState<Leftover[] | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -20,11 +23,16 @@ function UninstallPanel({ app, onClose }: { app: InstalledApp; onClose: () => vo
 
   const launch = async () => {
     setError(null);
+    setLaunching(true);
     try {
       await backend.launchUninstaller(app.uninstallString!);
       setLaunched(true);
     } catch (e) {
-      setError(String(e));
+      // Keep `launched` false so the button stays clickable — a declined UAC
+      // prompt is the most common failure and the user will want to retry.
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setLaunching(false);
     }
   };
 
@@ -65,6 +73,7 @@ function UninstallPanel({ app, onClose }: { app: InstalledApp; onClose: () => vo
         setError(`${failed.length} item(s) could not be removed even with admin rights.`);
       }
       queryClient.invalidateQueries({ queryKey: ["installedApps"] });
+      refreshAfterCleanup(queryClient);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -92,15 +101,27 @@ function UninstallPanel({ app, onClose }: { app: InstalledApp; onClose: () => vo
           <span className="flex-1">
             Run the app's own uninstaller{app.uninstallString ? "" : " (not available for this app)"}.
           </span>
-          <Button size="sm" disabled={!app.uninstallString || launched} onClick={launch}>
-            <ExternalLink className="h-3.5 w-3.5" />
-            {launched ? "Launched" : "Launch Uninstaller"}
+          <Button
+            size="sm"
+            disabled={!app.uninstallString || launching}
+            onClick={launch}
+          >
+            {launching ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <ExternalLink className="h-3.5 w-3.5" />
+            )}
+            {launching ? "Starting…" : launched ? "Launch Again" : "Launch Uninstaller"}
           </Button>
         </div>
-        {launched && (
+        {launching && (
           <p className="ml-8 text-xs text-muted">
-            Complete the uninstaller window that just opened (it may ask for administrator
-            permission), then continue with step 2.
+            Waiting for Windows — approve the administrator prompt if one appears.
+          </p>
+        )}
+        {launched && !launching && (
+          <p className="ml-8 text-xs text-muted">
+            Complete the uninstaller window that just opened, then continue with step 2.
           </p>
         )}
 
@@ -224,6 +245,14 @@ export function InstalledApps() {
     queryFn: backend.getAppUsage,
     staleTime: 5 * 60_000,
   });
+  // Logos are extracted from each app's executable in one batched call, keyed
+  // by app name. Icons rarely change, so they are cached for the session.
+  const { data: icons } = useQuery({
+    queryKey: ["appIcons", apps?.length ?? 0],
+    queryFn: () => backend.getAppIcons(apps ?? []),
+    enabled: (apps?.length ?? 0) > 0,
+    staleTime: Infinity,
+  });
 
   const merged: MergedApp[] = useMemo(() => {
     const byName = new Map((usage ?? []).map((u) => [u.name, u]));
@@ -305,9 +334,14 @@ export function InstalledApps() {
                       onClick={() => setOpenApp(isOpen ? null : app.name)}
                     >
                       <td className="px-5 py-3">
-                        <div className="font-medium">{app.name}</div>
-                        <div className="text-xs text-muted">
-                          {[app.publisher, app.version].filter(Boolean).join(" · ")}
+                        <div className="flex items-center gap-3">
+                          <AppLogo name={app.name} src={icons?.[app.name]} />
+                          <div className="min-w-0">
+                            <div className="truncate font-medium">{app.name}</div>
+                            <div className="truncate text-xs text-muted">
+                              {[app.publisher, app.version].filter(Boolean).join(" · ")}
+                            </div>
+                          </div>
                         </div>
                       </td>
                       <td className="px-5 py-3 text-right">
@@ -423,7 +457,7 @@ export function InstalledApps() {
         onDone={(freed) => {
           setNotice(`Freed ${formatBytes(freed)} — caches permanently removed to reclaim space.`);
           setCleanTarget(null);
-          queryClient.invalidateQueries({ queryKey: ["appUsage"] });
+          refreshAfterCleanup(queryClient);
         }}
         onClose={() => setCleanTarget(null)}
       />

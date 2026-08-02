@@ -7,12 +7,14 @@ import {
   FolderTree,
   HardDrive,
   LayoutDashboard,
+  Loader2,
   Search,
   Settings,
   Sparkles,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { useLicense } from "@/components/LicenseProvider";
+import { useRunningTasks } from "@/components/RunningTasksProvider";
 
 const navItems = [
   { to: "/", label: "Dashboard", icon: LayoutDashboard },
@@ -28,6 +30,16 @@ const navItems = [
 
 export function Layout() {
   const { isPro } = useLicense();
+  const { scanning, dupeScanning, deepSearching } = useRunningTasks();
+
+  // These keep running while you are on another page, so the sidebar says so —
+  // otherwise leaving the tab looks indistinguishable from cancelling.
+  const busy: Record<string, boolean> = {
+    "/": scanning,
+    "/duplicates": dupeScanning,
+    "/search": deepSearching,
+  };
+
   return (
     <div className="flex h-full">
       <aside className="flex w-60 shrink-0 flex-col border-r border-border bg-surface">
@@ -53,8 +65,14 @@ export function Layout() {
                 )
               }
             >
-              <Icon className="h-4 w-4" />
-              {label}
+              <Icon className="h-4 w-4 shrink-0" />
+              <span className="flex-1">{label}</span>
+              {busy[to] && (
+                <Loader2
+                  className="h-3.5 w-3.5 shrink-0 animate-spin text-primary"
+                  aria-label="Still running"
+                />
+              )}
             </NavLink>
           ))}
         </nav>

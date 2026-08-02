@@ -7,8 +7,8 @@ use sysinfo::Disks;
 const OLD_INSTALLER_DAYS: i64 = 180;
 
 struct Candidate {
-    id: &'static str,
-    name: &'static str,
+    id: String,
+    name: String,
     description: String,
     recoverable_bytes: u64,
     risk: &'static str,
@@ -28,8 +28,8 @@ fn measure(paths: Vec<Option<PathBuf>>) -> (u64, Vec<String>) {
 }
 
 fn simple(
-    id: &'static str,
-    name: &'static str,
+    id: &str,
+    name: &str,
     description: &str,
     risk: &'static str,
     recommended: bool,
@@ -40,8 +40,8 @@ fn simple(
         return None;
     }
     Some(Candidate {
-        id,
-        name,
+        id: id.to_string(),
+        name: name.to_string(),
         description: description.to_string(),
         recoverable_bytes: bytes,
         risk,
@@ -274,7 +274,128 @@ fn build_candidates(conn: &Connection, scan_id: i64) -> Vec<Candidate> {
         candidates.push(c);
     }
 
+    candidates.extend(discovered(conn, scan_id, &candidates));
+
     candidates
+}
+
+/// Safe-to-clear folders the fixed catalogue above has never heard of.
+///
+/// The Storage Breakdown badges anything the classifier calls "safe to clear",
+/// wherever it lives — a cache on a second drive, a stray `node_modules`, an
+/// application nobody wrote a rule for. None of it reached this page, so the
+/// two screens disagreed about what could be cleaned. This promotes them,
+/// reading the folders the scan already recorded so it costs a query rather
+/// than another walk of the disk.
+fn discovered(conn: &Connection, scan_id: i64, catalogue: &[Candidate]) -> Vec<Candidate> {
+    /// Below this a folder is not worth a row of its own.
+    const MIN_BYTES: u64 = 50 * 1024 * 1024;
+
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT path, size_bytes FROM folders
+         WHERE scan_id = ?1 AND size_bytes >= ?2 ORDER BY size_bytes DESC",
+    ) else {
+        return Vec::new();
+    };
+    let Ok(rows) = stmt.query_map(rusqlite::params![scan_id, MIN_BYTES], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?))
+    }) else {
+        return Vec::new();
+    };
+
+    // Anything the catalogue already lists, so nothing is offered twice.
+    let covered: Vec<String> = catalogue
+        .iter()
+        .flat_map(|c| c.paths.iter().map(|p| p.to_lowercase()))
+        .collect();
+
+    // Measured live: the recorded sizes are a snapshot and may have moved on.
+    group_safe_folders(rows.flatten().map(|(path, _)| path), &covered)
+        .into_iter()
+        .filter_map(|(category, explanation, paths)| {
+            let existing: Vec<PathBuf> = paths
+                .into_iter()
+                .map(PathBuf::from)
+                .filter(|p| p.exists())
+                .collect();
+            let bytes: u64 = existing.iter().map(|p| dir_size(p)).sum();
+            if bytes < MIN_BYTES {
+                return None;
+            }
+            Some(Candidate {
+                // Used as the DB primary key, so it must be stable.
+                id: format!("discovered-{}", slug(&category)),
+                name: format!("{category} (found on your drives)"),
+                description: format!(
+                    "{} {} location(s) found outside the usual folders. {}",
+                    existing.len(),
+                    category.to_lowercase(),
+                    explanation
+                ),
+                recoverable_bytes: bytes,
+                risk: "low",
+                // Listed but not pre-selected. These were found by the
+                // classifier rather than written into the catalogue by hand,
+                // and one of them may be a project the user is mid-way
+                // through — showing them was the gap, auto-cleaning them
+                // would be a different decision.
+                recommended: false,
+                paths: existing
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// Picks the safe-to-clear folders worth offering and groups them by category.
+///
+/// `paths` arrives largest first. Anything already covered by the catalogue is
+/// dropped, as is any folder nested inside one that was already kept — both
+/// would otherwise have their bytes counted twice.
+fn group_safe_folders(
+    paths: impl Iterator<Item = String>,
+    covered: &[String],
+) -> Vec<(String, String, Vec<String>)> {
+    const MAX_PER_CATEGORY: usize = 40;
+
+    let mut groups: Vec<(String, String, Vec<String>)> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+
+    for path in paths {
+        let Some(class) = crate::classify::classify(std::path::Path::new(&path), true) else {
+            continue;
+        };
+        if class.safety != "safe" {
+            continue;
+        }
+        let lower = path.to_lowercase();
+        let inside = |parents: &[String]| {
+            parents
+                .iter()
+                .any(|p| lower == *p || lower.starts_with(&format!("{p}\\")))
+        };
+        if inside(covered) || inside(&kept) {
+            continue;
+        }
+        kept.push(lower);
+
+        match groups.iter_mut().find(|(cat, _, _)| *cat == class.category) {
+            Some((_, _, paths)) if paths.len() < MAX_PER_CATEGORY => paths.push(path),
+            Some(_) => {}
+            None => groups.push((class.category, class.explanation, vec![path])),
+        }
+    }
+    groups
+}
+
+fn slug(text: &str) -> String {
+    text.chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch.to_ascii_lowercase() } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string()
 }
 
 /// Old installers and disc images in Downloads, based on the last scan's
@@ -310,8 +431,8 @@ fn old_installers(conn: &Connection, scan_id: i64) -> Option<Candidate> {
     }
     let bytes: u64 = old.iter().map(|(_, size, _)| size).sum();
     Some(Candidate {
-        id: "old-installers",
-        name: "Old Installers in Downloads",
+        id: "old-installers".to_string(),
+        name: "Old Installers in Downloads".to_string(),
         description: format!(
             "{} installer/ISO file(s) in Downloads not modified in over {} months. Delete them if no longer required.",
             old.len(),
@@ -342,7 +463,7 @@ pub fn generate(conn: &Connection, scan_id: i64) -> Result<u64, String> {
 
     let mut total = 0u64;
     for c in &candidates {
-        let is_ignored = ignored.contains(c.id);
+        let is_ignored = ignored.contains(&c.id);
         if !is_ignored {
             total += c.recoverable_bytes;
         }
@@ -372,4 +493,67 @@ pub fn generate(conn: &Connection, scan_id: i64) -> Result<u64, String> {
     .map_err(|e| e.to_string())?;
 
     Ok(total)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn grouped(paths: &[&str], covered: &[&str]) -> Vec<(String, Vec<String>)> {
+        let covered: Vec<String> = covered.iter().map(|c| c.to_lowercase()).collect();
+        group_safe_folders(paths.iter().map(|p| p.to_string()), &covered)
+            .into_iter()
+            .map(|(category, _, paths)| (category, paths))
+            .collect()
+    }
+
+    /// Everything the Storage Breakdown badges "safe to clear" should reach
+    /// the Recommendations page, wherever on the disks it happens to live.
+    #[test]
+    fn safe_folders_outside_the_catalogue_are_promoted() {
+        let groups = grouped(
+            &[
+                r"D:\Projects\site\node_modules",
+                r"D:\App\Electron\Cache",
+                r"D:\Users\me\Documents",        // personal — never offered
+                r"C:\Windows\WinSxS",            // system — never offered
+            ],
+            &[],
+        );
+        assert_eq!(
+            groups,
+            vec![
+                (
+                    "Project dependencies".to_string(),
+                    vec![r"D:\Projects\site\node_modules".to_string()]
+                ),
+                ("Cache".to_string(), vec![r"D:\App\Electron\Cache".to_string()]),
+            ]
+        );
+    }
+
+    /// Double counting is the failure mode that matters: a folder already
+    /// offered by the fixed catalogue, or nested inside one already kept,
+    /// must not be added again.
+    #[test]
+    fn overlapping_folders_are_counted_once() {
+        let groups = grouped(
+            &[
+                r"D:\App\Cache",                    // kept
+                r"D:\App\Cache\images",             // nested in the above
+                r"C:\Users\me\AppData\Local\Temp",  // already in the catalogue
+            ],
+            &[r"C:\Users\me\AppData\Local\Temp"],
+        );
+        assert_eq!(
+            groups,
+            vec![("Cache".to_string(), vec![r"D:\App\Cache".to_string()])]
+        );
+    }
+
+    #[test]
+    fn category_slugs_are_stable_primary_keys() {
+        assert_eq!(slug("Logs & dumps"), "logs---dumps");
+        assert_eq!(slug("Project dependencies"), "project-dependencies");
+    }
 }

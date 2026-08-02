@@ -36,8 +36,24 @@ export function Dashboard() {
     queryFn: backend.getLastScan,
   });
 
-  const primaryDrive = scan?.drives[0];
-  const totalUsedBytes = (scan?.drives ?? []).reduce((s, d) => s + d.usedBytes, 0);
+  // Capacity is read live and kept refreshing, so emptying the Recycle Bin or
+  // deleting anything outside the app shows up here within seconds instead of
+  // waiting for the next scan.
+  const { data: liveDrives } = useQuery({
+    queryKey: ["drives"],
+    queryFn: backend.getDrives,
+    refetchInterval: scanning ? false : 5_000,
+    refetchIntervalInBackground: false,
+    staleTime: 0,
+  });
+
+  // Fall back to the scan snapshot until the first live reading lands.
+  const drives = (scan?.drives ?? []).map((scanned) => {
+    const live = liveDrives?.find((d) => d.letter === scanned.letter);
+    return live ? { ...scanned, ...live } : scanned;
+  });
+  const primaryDrive = drives[0];
+  const totalUsedBytes = drives.reduce((s, d) => s + d.usedBytes, 0);
 
   return (
     <div>
@@ -114,7 +130,7 @@ export function Dashboard() {
                 <CardTitle>Drives</CardTitle>
               </CardHeader>
               <CardContent className="flex flex-col gap-4">
-                {scan.drives.map((drive) => {
+                {drives.map((drive) => {
                   const usedPct = (drive.usedBytes / drive.totalBytes) * 100;
                   return (
                     <div key={drive.letter}>
@@ -152,7 +168,8 @@ export function Dashboard() {
                     <span className="ml-4 shrink-0 text-muted">
                       {formatBytes(folder.sizeBytes)}
                       <span className="ml-2 text-xs">
-                        {formatPercent(folder.sizeBytes, primaryDrive.usedBytes)}
+                        {/* Against everything scanned — the list spans drives. */}
+                        {formatPercent(folder.sizeBytes, totalUsedBytes)}
                       </span>
                     </span>
                   </div>

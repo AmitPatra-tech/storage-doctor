@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { CopyCheck, FolderOpen, FolderSearch, Loader2, Trash2 } from "lucide-react";
 import { backend } from "@/lib/backend";
+import { refreshAfterCleanup } from "@/lib/refresh";
 import { formatBytes } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -11,6 +12,7 @@ import { ConfirmDeleteModal } from "@/components/ConfirmDeleteModal";
 import { UpgradePanel } from "@/components/ProGate";
 import { useLicense } from "@/components/LicenseProvider";
 import { useRunningTasks } from "@/components/RunningTasksProvider";
+import { Thumbnail, useThumbnails } from "@/components/Thumbnail";
 
 function formatDate(iso: string): string {
   if (!iso) return "unknown date";
@@ -88,10 +90,19 @@ export function Duplicates() {
     );
     setSelected(new Set());
     setNotice(`Freed ${formatBytes(freed)} — files are in the Recycle Bin.`);
-    queryClient.invalidateQueries({ queryKey: ["lastScan"] });
+    refreshAfterCleanup(queryClient);
   };
 
   const selectedBytes = selectedItems.reduce((s, i) => s + i.sizeBytes, 0);
+
+  // One batched preview request for every file on screen. Within a duplicate
+  // group all copies are byte-identical, so they render the same image — that
+  // is exactly what makes the group easy to confirm at a glance.
+  const visiblePaths = useMemo(
+    () => (groups ?? []).flatMap((g) => g.files.map((f) => f.path)),
+    [groups]
+  );
+  const { data: thumbs } = useThumbnails(visiblePaths, 96);
 
   if (!isPro) {
     return (
@@ -149,7 +160,7 @@ export function Duplicates() {
             <CopyCheck className="h-10 w-10 text-success" />
             <p className="text-sm font-medium">No duplicates found</p>
             <p className="max-w-sm text-sm text-muted">
-              Your user folders contain no identical files larger than 1 MB.
+              No identical files were found in the folders that were scanned.
             </p>
           </CardContent>
         </Card>
@@ -196,7 +207,13 @@ export function Duplicates() {
                           onChange={() => toggle(file.path)}
                           className="h-3.5 w-3.5 shrink-0 accent-[hsl(199_89%_48%)]"
                         />
-                        <span className="min-w-0 flex-1 truncate text-muted">{file.path}</span>
+                        <Thumbnail path={file.path} src={thumbs?.[file.path]} size={44} />
+                        <div className="min-w-0 flex-1">
+                          <div className="truncate">{file.path.split("\\").pop()}</div>
+                          <div className="truncate text-xs text-muted" title={file.path}>
+                            {file.path}
+                          </div>
+                        </div>
                         <span className="shrink-0 text-xs text-muted">
                           {formatDate(file.modifiedAt)}
                         </span>

@@ -1,3 +1,4 @@
+use crate::cleaner;
 use rayon::prelude::*;
 use serde::Serialize;
 use std::fs;
@@ -5,7 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
-use tauri::{AppHandle, Emitter};
+
+/// Where progress reports go. Counting bytes has no business depending on the
+/// window that displays them: with `AppHandle` named here, anything that
+/// referenced the scanner dragged the whole webview runtime into the link
+/// graph, and test binaries would not even load.
+pub type ProgressSink = Box<dyn Fn(ScanProgress) + Send + Sync>;
 
 /// Files below this size are never reported individually.
 pub const LARGE_FILE_THRESHOLD: u64 = 100 * 1024 * 1024;
@@ -41,6 +47,9 @@ pub struct FolderRecord {
     pub name: String,
     pub size_bytes: u64,
     pub file_count: u64,
+    /// How much of `size_bytes` is safe to clear. Recorded during the scan
+    /// because working it out later means walking the folder all over again.
+    pub recoverable_bytes: u64,
     pub depth: usize,
 }
 
@@ -63,7 +72,8 @@ pub struct ScanOutcome {
 
 struct ScanCtx {
     scan_id: i64,
-    app: AppHandle,
+    /// Absent when nothing is listening — a test, for instance.
+    progress: Option<ProgressSink>,
     files_scanned: AtomicU64,
     bytes_scanned: AtomicU64,
     errors: AtomicU64,
@@ -76,13 +86,14 @@ struct ScanCtx {
 struct DirStats {
     size: u64,
     files: u64,
+    recoverable: u64,
 }
 
-pub fn scan(app: AppHandle, scan_id: i64, roots: &[PathBuf]) -> ScanOutcome {
+pub fn scan(progress: Option<ProgressSink>, scan_id: i64, roots: &[PathBuf]) -> ScanOutcome {
     let started = Instant::now();
     let ctx = ScanCtx {
         scan_id,
-        app,
+        progress,
         files_scanned: AtomicU64::new(0),
         bytes_scanned: AtomicU64::new(0),
         errors: AtomicU64::new(0),
@@ -142,6 +153,11 @@ fn scan_dir(path: &Path, depth: usize, ctx: &ScanCtx) -> DirStats {
         let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
         local.size += size;
         local.files += 1;
+        // Only large files can be offered individually, so only they are worth
+        // classifying — this runs once per file across the whole drive.
+        if size >= cleaner::MIN_FILE_BYTES && cleaner::is_clearable_file(&entry.path(), size) {
+            local.recoverable += size;
+        }
 
         if size >= LARGE_FILE_THRESHOLD {
             record_large_file(&entry.path(), size, ctx);
@@ -160,12 +176,21 @@ fn scan_dir(path: &Path, depth: usize, ctx: &ScanCtx) -> DirStats {
         .reduce(DirStats::default, |a, b| DirStats {
             size: a.size + b.size,
             files: a.files + b.files,
+            recoverable: a.recoverable + b.recoverable,
         });
 
-    let total = DirStats {
+    let mut total = DirStats {
         size: local.size + sub_total.size,
         files: local.files + sub_total.files,
+        recoverable: local.recoverable + sub_total.recoverable,
     };
+    // Same rules the cleanup dialog applies, so a row's figure always matches
+    // what opening it actually offers.
+    match crate::classify::safety(path, true).as_deref() {
+        Some("safe") => total.recoverable = total.size,
+        Some("system") => total.recoverable = 0,
+        _ => {}
+    }
 
     if depth > 0 && depth <= FOLDER_RECORD_DEPTH && total.size >= FOLDER_MIN_BYTES {
         if let Ok(mut folders) = ctx.folders.lock() {
@@ -177,6 +202,7 @@ fn scan_dir(path: &Path, depth: usize, ctx: &ScanCtx) -> DirStats {
                     .unwrap_or_else(|| path.to_string_lossy().into_owned()),
                 size_bytes: total.size,
                 file_count: total.files,
+                recoverable_bytes: total.recoverable,
                 depth,
             });
         }
@@ -228,7 +254,9 @@ fn maybe_emit_progress(current: &Path, ctx: &ScanCtx) {
         bytes_scanned: ctx.bytes_scanned.load(Ordering::Relaxed),
         current_path: current.to_string_lossy().into_owned(),
     };
-    let _ = ctx.app.emit("scan-progress", payload);
+    if let Some(report) = &ctx.progress {
+        report(payload);
+    }
 }
 
 fn system_time_to_rfc3339(time: SystemTime) -> String {

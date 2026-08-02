@@ -52,8 +52,18 @@ Run these in `npm run tauri dev` (or the installed build):
 ## Build the installer
 
 The build must be able to sign the updater artifacts, so set the update-signing
-key first (this is the minisign key generated at setup, NOT a code-signing cert):
+key first (this is the minisign key generated at setup, NOT a code-signing cert).
+Env vars only last for the shell session/command that sets them — set them in
+the same terminal you run the build in.
 
+PowerShell (Windows default):
+```powershell
+$env:TAURI_SIGNING_PRIVATE_KEY = Get-Content -Raw "$env:USERPROFILE\.tauri\storage-doctor.key"
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD = ""   # empty — the key has no password
+npm run tauri build
+```
+
+bash / git-bash:
 ```sh
 export TAURI_SIGNING_PRIVATE_KEY="$(cat ~/.tauri/storage-doctor.key)"
 export TAURI_SIGNING_PRIVATE_KEY_PASSWORD=""   # empty — the key has no password

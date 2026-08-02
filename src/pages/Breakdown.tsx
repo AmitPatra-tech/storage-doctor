@@ -1,16 +1,18 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronRight,
   File,
   Folder,
   FolderOpen,
+  Info,
   Loader2,
   Sparkles,
   Trash2,
 } from "lucide-react";
 import { backend } from "@/lib/backend";
-import { formatBytes, formatPercent } from "@/lib/utils";
+import { refreshAfterCleanup } from "@/lib/refresh";
+import { formatBytes, formatPercent, formatRelativeTime } from "@/lib/utils";
 import type { Classification, SafeItem } from "@/lib/types";
 import { SafetyBadge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -31,6 +33,9 @@ interface Row {
   isDir: boolean;
   sizeBytes: number;
   fileCount: number;
+  /** `0` = nothing to clear, `null` = this scan never measured it. Neither
+   *  gets a cleanup action; the banner explains the `null` case. */
+  recoverableBytes: number | null;
   classification?: Classification | null;
 }
 
@@ -180,25 +185,101 @@ export function Breakdown() {
     queryFn: backend.getLastScan,
   });
 
-  const { data: browsed, isFetching } = useQuery({
+  const { data: browsed, isFetching, dataUpdatedAt } = useQuery({
     queryKey: ["browse", current?.path],
     queryFn: () => backend.browseFolder(current!.path),
     enabled: current !== null,
-    staleTime: 60_000,
+    // Re-measured on every visit: the sizes here are read live from disk and
+    // must not be served from cache after something was deleted.
+    staleTime: 0,
+    gcTime: 0,
   });
 
-  const parentBytes = current?.sizeBytes ?? scan?.drives[0]?.usedBytes ?? 0;
+  // Measuring a folder also corrects its recorded size in the stored scan, so
+  // pick the corrected numbers up for the list behind this one.
+  useEffect(() => {
+    if (browsed) queryClient.invalidateQueries({ queryKey: ["lastScan"] });
+  }, [dataUpdatedAt, browsed, queryClient]);
+
+  // The top-level list covers every scanned drive, so percentages are shares
+  // of everything scanned rather than of one drive.
+  const scannedUsedBytes = (scan?.drives ?? []).reduce((s, d) => s + d.usedBytes, 0);
+
+  // Folders the last scan never measured. Rather than making the user run
+  // another scan or open each one, measure them here and fill the figures in
+  // as they arrive.
+  const [measured, setMeasured] = useState<Record<string, number>>({});
+  const [measuring, setMeasuring] = useState(false);
+  /** Paths already handed to the backend, so a refetch mid-run never starts a
+   *  second walk over the same folders. */
+  const requested = useRef<Set<string>>(new Set());
+
+  // Kept separate from the trigger below and mounted once: results stream in
+  // over the whole run, and re-subscribing on every refetch would drop them.
+  useEffect(() => {
+    let live = true;
+    let stop: (() => void) | undefined;
+    backend
+      .onFolderMeasured((m) => {
+        if (live) setMeasured((prev) => ({ ...prev, [m.path]: m.recoverableBytes }));
+      })
+      .then((unsubscribe) => {
+        if (live) stop = unsubscribe;
+        else unsubscribe();
+      });
+    return () => {
+      live = false;
+      stop?.();
+    };
+  }, []);
+
+  const scanFolders = scan?.largestFolders;
+  useEffect(() => {
+    const missing = (scanFolders ?? [])
+      .filter((f) => f.recoverableBytes === null && !requested.current.has(f.path))
+      .map((f) => f.path);
+    if (missing.length === 0) return;
+    missing.forEach((path) => requested.current.add(path));
+
+    setMeasuring(true);
+    backend.measureRecoverable(missing).finally(() => {
+      setMeasuring(false);
+      // The measurements were stored too, so pick them up from the scan.
+      queryClient.invalidateQueries({ queryKey: ["lastScan"] });
+    });
+  }, [scanFolders, queryClient]);
+
+  // Inside a folder, percentages are shares of what it actually holds now —
+  // not of the size the last scan recorded for it, which may be long stale.
+  const liveBytes = (browsed ?? []).reduce((s, e) => s + e.sizeBytes, 0);
+  const parentBytes = current === null ? scannedUsedBytes : liveBytes;
+
+  // The list you clicked through showed a scanned size; this folder was just
+  // measured live. When they disagree the user deserves to be told why rather
+  // than left staring at "330 MB" turning into "129 B".
+  const recordedBytes = current?.sizeBytes ?? 0;
+  const shrankSinceScan =
+    browsed !== undefined &&
+    browsed.length < 300 &&
+    recordedBytes > 0 &&
+    recordedBytes - liveBytes > 4 * 2 ** 20 &&
+    liveBytes < recordedBytes * 0.9;
 
   const rows: Row[] | undefined =
     current === null
-      ? scan?.largestFolders.map((f) => ({
-          path: f.path,
-          name: f.name,
-          isDir: true,
-          sizeBytes: f.sizeBytes,
-          fileCount: f.fileCount,
-          classification: f.classification,
-        }))
+      ? scan?.largestFolders
+          // A folder the scan recorded can be gone or empty by now; the stored
+          // size is updated on delete, so drop anything that reached zero.
+          .filter((f) => f.sizeBytes > 0)
+          .map((f) => ({
+            path: f.path,
+            name: f.name,
+            isDir: true,
+            sizeBytes: f.sizeBytes,
+            fileCount: f.fileCount,
+            recoverableBytes: f.recoverableBytes ?? measured[f.path] ?? null,
+            classification: f.classification,
+          }))
       : browsed;
 
   const navigate = (next: Crumb[]) => {
@@ -224,8 +305,7 @@ export function Breakdown() {
     setCleanTarget(null);
     setSelected(new Set());
     setNotice(`Freed ${formatBytes(freed)} — ${message}`);
-    queryClient.invalidateQueries({ queryKey: ["browse"] });
-    queryClient.invalidateQueries({ queryKey: ["lastScan"] });
+    refreshAfterCleanup(queryClient);
   };
   const afterDelete = (freed: number) =>
     finishDelete(freed, "items moved to the Recycle Bin.");
@@ -296,6 +376,40 @@ export function Breakdown() {
         </div>
       )}
 
+      {current === null && scan && (
+        <p className="mb-3 flex items-start gap-2 text-xs text-muted">
+          <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+          <span>
+            Sizes here were measured during your last scan (
+            {formatRelativeTime(scan.startedAt)}). Open any folder to measure it live —
+            the list updates with what is found.
+            {measuring && (
+              <>
+                {" "}
+                <span className="text-foreground">
+                  Working out how much can be cleared from each folder — figures appear
+                  as they are measured.
+                </span>
+              </>
+            )}
+          </span>
+        </p>
+      )}
+
+      {shrankSinceScan && current && (
+        <div className="mb-3 flex items-start gap-2 rounded-md border border-border bg-surface px-4 py-2.5 text-sm">
+          <Info className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+          <span className="text-muted">
+            <span className="text-foreground">{current.name}</span> holds{" "}
+            <span className="font-medium text-foreground">{formatBytes(liveBytes)}</span> right
+            now. The previous screen showed{" "}
+            <span className="font-medium text-foreground">{formatBytes(recordedBytes)}</span>{" "}
+            because that is what your last scan recorded — its contents have been removed
+            since. The list has been corrected.
+          </span>
+        </div>
+      )}
+
       <Card>
         <CardContent className="divide-y divide-border p-0">
           {isFetching && (
@@ -360,17 +474,25 @@ export function Breakdown() {
                       {entry.isDir && ` · ${entry.fileCount.toLocaleString()} files`}
                     </div>
                   </div>
-                  {entry.isDir && !isSystem && (
+                  {/* Only offered where there is genuinely something to
+                      reclaim, labelled with how much — the row's own size is
+                      what the folder holds, not what cleanup can free. */}
+                  {entry.isDir && !isSystem && (entry.recoverableBytes ?? 0) > 0 && (
                     <Button
                       variant="ghost"
-                      size="icon"
-                      title="Find everything safe to delete inside this folder"
+                      size="sm"
+                      title={`Recoverable space — ${formatBytes(
+                        entry.recoverableBytes!
+                      )} of caches, temporary files and logs can be cleared from this folder`}
                       onClick={(e) => {
                         e.stopPropagation();
                         setCleanTarget(entry.path);
                       }}
                     >
-                      <Sparkles className="h-4 w-4 text-success" />
+                      <Sparkles className="h-4 w-4 shrink-0 text-success" />
+                      <span className="text-xs text-success">
+                        {formatBytes(entry.recoverableBytes!)}
+                      </span>
                     </Button>
                   )}
                   {entry.isDir && (

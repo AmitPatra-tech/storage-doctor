@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AppWindow,
   File,
@@ -10,9 +10,11 @@ import {
   Search,
   Sparkles,
   Trash2,
+  X,
 } from "lucide-react";
 import { useNavigate } from "react-router-dom";
 import { backend } from "@/lib/backend";
+import { refreshAfterCleanup } from "@/lib/refresh";
 import { formatBytes } from "@/lib/utils";
 import type { SearchResultItem } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -20,6 +22,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { PageHeader } from "@/components/PageHeader";
 import { ConfirmDeleteModal, type DeleteItem } from "@/components/ConfirmDeleteModal";
 import { useRunningTasks } from "@/components/RunningTasksProvider";
+import { Thumbnail, useThumbnails } from "@/components/Thumbnail";
 
 const KIND_META = {
   folder: { label: "Folders", icon: Folder },
@@ -34,15 +37,20 @@ function ResultRow({
   onDelete,
   checked,
   onToggle,
+  thumbnail,
 }: {
   result: SearchResultItem;
   onOpen: (r: SearchResultItem) => void;
   onDelete?: (r: SearchResultItem) => void;
   checked?: boolean;
   onToggle?: (path: string) => void;
+  thumbnail?: string;
 }) {
   const Icon = KIND_META[result.kind].icon;
   const deletable = onDelete && (result.kind === "file" || result.kind === "folder");
+  // Files and folders get a visual preview so you can see what you are about
+  // to delete; recommendations and apps stay as plain category icons.
+  const showPreview = result.kind === "file" || result.kind === "folder";
   return (
     <div className="flex items-center gap-3 px-5 py-3">
       {onToggle && (
@@ -53,7 +61,16 @@ function ResultRow({
           className="h-3.5 w-3.5 shrink-0 accent-[hsl(199_89%_48%)]"
         />
       )}
-      <Icon className="h-4 w-4 shrink-0 text-primary" />
+      {showPreview ? (
+        <Thumbnail
+          path={result.path}
+          src={thumbnail}
+          isDir={result.kind === "folder"}
+          size={36}
+        />
+      ) : (
+        <Icon className="h-4 w-4 shrink-0 text-primary" />
+      )}
       <div className="min-w-0 flex-1">
         <div className="truncate text-sm font-medium">{result.name}</div>
         {result.path && <div className="truncate text-xs text-muted">{result.path}</div>}
@@ -89,33 +106,33 @@ function ResultRow({
 
 export function SearchPage() {
   const navigate = useNavigate();
-  const [input, setInput] = useState("");
-  const [query, setQuery] = useState("");
-
-  // Deep filesystem search runs in the app-root provider so navigating away
-  // does not stop it; results persist and reappear when you return.
+  const queryClient = useQueryClient();
+  // The query and the deep filesystem search both live in the app-root
+  // provider, so navigating away neither stops the search nor loses the box
+  // it belongs to — come back and the page is exactly as you left it.
   const {
+    searchInput: input,
+    setSearchInput: setInput,
+    searchQuery: query,
     deepQuery,
     deepSearching: deepBusy,
     deepFound,
     deepResults,
     setDeepResults,
     runDeepSearch,
+    cancelDeepSearch,
   } = useRunningTasks();
   const [deepSelected, setDeepSelected] = useState<Set<string>>(new Set());
   const [bulkConfirm, setBulkConfirm] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<SearchResultItem | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
 
-  useEffect(() => {
-    const t = setTimeout(() => setQuery(input.trim()), 300);
-    return () => clearTimeout(t);
-  }, [input]);
-
   // Show deep results only for the current query; results for a previous query
   // remain in the provider but the search button reappears for the new one.
   const deepForQuery = deepResults !== null && deepQuery === query;
 
+  // A running search is only ever stopped by the user pressing Stop, or by
+  // starting another one — never as a side effect of rendering.
   useEffect(() => {
     setDeepSelected(new Set());
   }, [query]);
@@ -130,6 +147,17 @@ export function SearchPage() {
     .map((kind) => ({ kind, items: (results ?? []).filter((r) => r.kind === kind) }))
     .filter((g) => g.items.length > 0);
 
+  // Previews for everything on screen — indexed hits and deep-search hits —
+  // fetched in one batched call so you can see each file before deleting it.
+  const previewPaths = useMemo(
+    () =>
+      [...(results ?? []), ...(deepResults ?? [])]
+        .filter((r) => (r.kind === "file" || r.kind === "folder") && r.path)
+        .map((r) => r.path),
+    [results, deepResults]
+  );
+  const { data: thumbs } = useThumbnails(previewPaths, 64);
+
   const open = (result: SearchResultItem) => {
     if (result.kind === "recommendation") navigate("/recommendations");
     else if (result.kind === "app") navigate("/applications");
@@ -143,6 +171,7 @@ export function SearchPage() {
     if (removed) {
       setDeepResults((prev) => prev?.filter((r) => r.path !== removed) ?? null);
     }
+    refreshAfterCleanup(queryClient);
   };
 
   const startDeepSearch = () => {
@@ -165,6 +194,7 @@ export function SearchPage() {
     setDeepSelected(new Set());
     setNotice(`Freed ${formatBytes(freed)} — items are in the Recycle Bin.`);
     setDeepResults((prev) => prev?.filter((r) => !removed.has(r.path)) ?? null);
+    refreshAfterCleanup(queryClient);
   };
 
   return (
@@ -206,6 +236,7 @@ export function SearchPage() {
                     result={result}
                     onOpen={open}
                     onDelete={setDeleteTarget}
+                    thumbnail={thumbs?.[result.path]}
                   />
                 ))}
               </CardContent>
@@ -226,7 +257,13 @@ export function SearchPage() {
                   Search all files for "{query}"
                 </Button>
               )}
-              {deepForQuery && deepResults!.length > 0 && (
+              {deepBusy && (
+                <Button variant="secondary" size="sm" onClick={cancelDeepSearch}>
+                  <X className="h-3.5 w-3.5" />
+                  Stop
+                </Button>
+              )}
+              {deepForQuery && !deepBusy && deepResults!.length > 0 && (
                 <div className="flex items-center gap-2">
                   <label className="flex cursor-pointer items-center gap-1.5 text-xs text-muted">
                     <input
@@ -256,7 +293,7 @@ export function SearchPage() {
               )}
             </div>
             {deepBusy && (
-              <Card>
+              <Card className="mb-2">
                 <CardContent className="flex flex-col gap-3 p-5">
                   <div className="flex items-center gap-3 text-sm text-muted">
                     <Loader2 className="h-4 w-4 animate-spin text-primary" />
@@ -269,10 +306,12 @@ export function SearchPage() {
                 </CardContent>
               </Card>
             )}
-            {deepForQuery && !deepBusy && (
+            {/* Results render while the walk is still running — matches show up
+                as they are found rather than only once every drive is read. */}
+            {deepForQuery && (deepResults!.length > 0 || !deepBusy) && (
               <Card>
                 <CardContent className="divide-y divide-border p-0">
-                  {deepResults!.length === 0 && (
+                  {deepResults!.length === 0 && !deepBusy && (
                     <p className="p-5 text-sm text-muted">
                       No files or folders named like "{query}" were found on your drives.
                     </p>
@@ -285,6 +324,7 @@ export function SearchPage() {
                       onDelete={setDeleteTarget}
                       checked={deepSelected.has(result.path)}
                       onToggle={toggleDeep}
+                      thumbnail={thumbs?.[result.path]}
                     />
                   ))}
                 </CardContent>

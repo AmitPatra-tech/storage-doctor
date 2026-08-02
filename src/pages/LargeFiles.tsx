@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { EyeOff, FolderOpen, Trash2 } from "lucide-react";
 import { backend } from "@/lib/backend";
+import { refreshAfterCleanup } from "@/lib/refresh";
 import { formatBytes } from "@/lib/utils";
 import type { LargeFile } from "@/lib/types";
 import { Button } from "@/components/ui/button";
@@ -89,7 +90,7 @@ export function LargeFiles() {
     setConfirmOpen(false);
     setSelected(new Set());
     setNotice(`Freed ${formatBytes(freed)} — files permanently deleted.`);
-    queryClient.invalidateQueries({ queryKey: ["lastScan"] });
+    refreshAfterCleanup(queryClient);
   };
 
   const totalBytes = files.reduce((sum, f) => sum + f.sizeBytes, 0);

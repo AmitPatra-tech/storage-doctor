@@ -1,12 +1,12 @@
 use crate::apps::dir_size;
 use rayon::prelude::*;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 use winreg::RegKey;
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct InstalledApp {
     pub name: String,
@@ -15,6 +15,26 @@ pub struct InstalledApp {
     pub install_location: Option<String>,
     pub estimated_bytes: u64,
     pub uninstall_string: Option<String>,
+    /// Registry `DisplayIcon` — where the app's logo lives. May carry a
+    /// trailing `,<index>`; see `thumbs::app_icon_source`.
+    pub display_icon: Option<String>,
+}
+
+/// Exposes command-line splitting to sibling modules (icon resolution needs
+/// the program out of an uninstall string).
+pub fn split_command_line_public(s: &str) -> (String, String) {
+    split_command_line(&expand_env_vars(s))
+}
+
+/// Exposes MSI product-code extraction (icon resolution falls back to the
+/// Windows Installer database for MSI packages).
+pub fn msi_product_code_public(s: &str) -> Option<String> {
+    msi_product_code(&expand_env_vars(s))
+}
+
+/// Exposes `%VAR%` expansion; MSI properties often contain `%APPDATA%`.
+pub fn expand_env_vars_public(s: &str) -> String {
+    expand_env_vars(s)
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -78,6 +98,10 @@ pub fn list_installed() -> Vec<InstalledApp> {
                     .get_value::<String, _>("UninstallString")
                     .ok()
                     .filter(|s| !s.trim().is_empty()),
+                display_icon: sub
+                    .get_value::<String, _>("DisplayIcon")
+                    .ok()
+                    .filter(|s| !s.trim().is_empty()),
                 name: name.clone(),
             };
 
@@ -97,15 +121,23 @@ pub fn list_installed() -> Vec<InstalledApp> {
     apps
 }
 
-/// Launches the application's own uninstaller (may show a UAC prompt).
+/// Launches the application's own uninstaller (shows a UAC prompt when the
+/// uninstaller requires administrator rights).
 ///
-/// The registry `UninstallString` is a raw command line — often a quoted
-/// path with arguments, or an `MsiExec.exe /I{GUID}` entry. We parse it into
-/// program + args and spawn the program directly, so Windows argument
-/// escaping does not mangle the quoted path (which previously caused the
-/// uninstaller to silently fail to launch).
+/// This goes through `ShellExecuteEx`, not `CreateProcess` (what
+/// `std::process::Command` uses). Nearly every machine-wide uninstaller
+/// (Inno Setup's `unins000.exe`, NSIS' `uninstall.exe`, InstallShield…) is
+/// manifested `requireAdministrator`, and `CreateProcess` refuses to start
+/// those — it fails with ERROR_ELEVATION_REQUIRED (os error 740) instead of
+/// prompting. `ShellExecuteEx` performs the elevation handshake, so the UAC
+/// dialog appears and the uninstaller actually runs.
+///
+/// The registry `UninstallString` is a raw command line. Arguments are passed
+/// through verbatim rather than re-quoted per token, which matters for entries
+/// like NVIDIA's `RunDll32.EXE "…\NVI2.DLL",UninstallPackage Display.Driver`.
 pub fn launch_uninstaller(uninstall_string: &str) -> Result<(), String> {
-    let s = uninstall_string.trim();
+    let expanded = expand_env_vars(uninstall_string.trim());
+    let s = expanded.trim();
     if s.is_empty() {
         return Err("This application does not provide an uninstaller command.".into());
     }
@@ -113,30 +145,119 @@ pub fn launch_uninstaller(uninstall_string: &str) -> Result<(), String> {
     // MSI: run msiexec with the uninstall flag directly, regardless of whether
     // the stored string used /I (modify) or /X (uninstall).
     if let Some(code) = msi_product_code(s) {
-        std::process::Command::new("msiexec")
-            .args(["/x", &code])
-            .spawn()
-            .map_err(|e| format!("Failed to launch msiexec: {e}"))?;
-        return Ok(());
+        return shell_execute("msiexec.exe", &format!("/x {code}"));
     }
 
     let (program, args) = split_command_line(s);
     if program.is_empty() {
         return Err("Could not parse the uninstaller command.".into());
     }
-    if !std::path::Path::new(&program).exists() {
-        return Err(format!("Uninstaller not found at {program}"));
+    // A rooted path that is not on disk means the registry entry is stale —
+    // report the whole command so the user can see what Windows recorded.
+    let rooted = program.contains(":\\") || program.starts_with("\\\\");
+    if rooted && !std::path::Path::new(&program).is_file() {
+        return Err(format!(
+            "The uninstaller is no longer on disk. Windows still lists this command:\n{s}\n\n\
+             Remove it from Settings → Apps instead."
+        ));
     }
-    std::process::Command::new(&program)
-        .args(&args)
-        .spawn()
-        .map_err(|e| format!("Failed to launch uninstaller: {e}"))?;
+    shell_execute(&program, &args)
+}
+
+/// Runs a program through the Windows shell so that manifest-declared
+/// elevation is honored (UAC prompt) instead of failing outright.
+fn shell_execute(program: &str, args: &str) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_CANCELLED};
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    fn wide(s: &str) -> Vec<u16> {
+        std::ffi::OsStr::new(s)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    }
+
+    let file = wide(program);
+    let params = wide(args);
+    // The working directory matters for uninstallers that look for sibling
+    // data files; use the program's own folder when we know it.
+    let directory = std::path::Path::new(program)
+        .parent()
+        .filter(|p| p.is_dir())
+        .map(|p| wide(&p.to_string_lossy()));
+
+    let mut info: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+    // NOASYNC is required because this runs on a worker thread with no message
+    // loop — without it the call can return before the shell has finished.
+    info.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC;
+    info.lpFile = file.as_ptr();
+    info.lpParameters = if args.is_empty() {
+        std::ptr::null()
+    } else {
+        params.as_ptr()
+    };
+    info.lpDirectory = directory
+        .as_ref()
+        .map(|d| d.as_ptr())
+        .unwrap_or(std::ptr::null());
+    info.nShow = SW_SHOWNORMAL;
+
+    let started = unsafe { ShellExecuteExW(&mut info) };
+    if started == 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(ERROR_CANCELLED as i32) {
+            return Err(
+                "Administrator permission was declined, so the uninstaller did not start.".into(),
+            );
+        }
+        return Err(format!("Windows could not start the uninstaller: {err}"));
+    }
+    if !info.hProcess.is_null() {
+        unsafe { CloseHandle(info.hProcess) };
+    }
     Ok(())
+}
+
+/// Expands `%VAR%` references, which some uninstall strings still use.
+fn expand_env_vars(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(start) = rest.find('%') {
+        let after = &rest[start + 1..];
+        match after.find('%') {
+            Some(end) => {
+                let name = &after[..end];
+                out.push_str(&rest[..start]);
+                match std::env::var(name) {
+                    Ok(value) if !name.is_empty() => out.push_str(&value),
+                    // Not a variable (e.g. a literal `%` in a path) — keep it.
+                    _ => {
+                        out.push('%');
+                        out.push_str(name);
+                        out.push('%');
+                    }
+                }
+                rest = &after[end + 1..];
+            }
+            None => break,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// Extracts the `{GUID}` product code from an MsiExec uninstall string.
 fn msi_product_code(s: &str) -> Option<String> {
-    if !s.to_lowercase().contains("msiexec") {
+    // Only the *program* may be msiexec — bundle uninstallers such as
+    // `"…\Package Cache\{GUID}\VC_redist.x64.exe" /uninstall` also contain a
+    // GUID and must not be rerouted through msiexec.
+    let head = s.split_whitespace().next()?.trim_matches('"').to_lowercase();
+    if !(head == "msiexec" || head == "msiexec.exe" || head.ends_with("\\msiexec.exe")) {
         return None;
     }
     let start = s.find('{')?;
@@ -144,28 +265,46 @@ fn msi_product_code(s: &str) -> Option<String> {
     Some(s[start..=end].to_string())
 }
 
-/// Splits a Windows command line into (program, args), honoring a leading
-/// quoted path and falling back to splitting after the first `.exe`.
-fn split_command_line(s: &str) -> (String, Vec<String>) {
+/// Splits a Windows command line into (program, raw argument string).
+///
+/// Registry uninstall strings come in every shape: quoted paths, *unquoted*
+/// paths containing spaces (`C:\Program Files\Android\Android Studio\uninstall.exe`),
+/// and bare commands resolved through PATH (`CMD /C "…\Doc_Uninstall.cmd"`).
+/// Splitting on the first `.exe` or on whitespace alone gets each of those
+/// wrong, so candidate prefixes are checked against the filesystem.
+fn split_command_line(s: &str) -> (String, String) {
     let s = s.trim();
+
+    // 1. Quoted program.
     if let Some(rest) = s.strip_prefix('"') {
         if let Some(i) = rest.find('"') {
-            let program = rest[..i].to_string();
-            let args = rest[i + 1..]
-                .split_whitespace()
-                .map(String::from)
-                .collect();
-            return (program, args);
+            return (rest[..i].to_string(), rest[i + 1..].trim().to_string());
         }
     }
-    let lower = s.to_lowercase();
-    if let Some(pos) = lower.find(".exe") {
-        let split_at = pos + 4;
-        let program = s[..split_at].to_string();
-        let args = s[split_at..].split_whitespace().map(String::from).collect();
-        return (program, args);
+
+    // 2. The entire string is the program — unquoted path with spaces, no args.
+    if std::path::Path::new(s).is_file() {
+        return (s.to_string(), String::new());
     }
-    (s.to_string(), Vec::new())
+
+    // 3. Longest prefix ending at an executable extension that exists on disk.
+    let lower = s.to_lowercase();
+    for ext in [".exe", ".cmd", ".bat", ".com"] {
+        let mut from = 0;
+        while let Some(pos) = lower[from..].find(ext) {
+            let end = from + pos + ext.len();
+            if std::path::Path::new(&s[..end]).is_file() {
+                return (s[..end].to_string(), s[end..].trim().to_string());
+            }
+            from = end;
+        }
+    }
+
+    // 4. First whitespace-delimited token; the shell resolves it against PATH.
+    match s.split_once(char::is_whitespace) {
+        Some((program, args)) => (program.to_string(), args.trim().to_string()),
+        None => (s.to_string(), String::new()),
+    }
 }
 
 fn norm(s: &str) -> String {
@@ -282,4 +421,179 @@ pub fn find_leftovers(
         .collect();
     leftovers.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
     leftovers
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Shapes taken verbatim from real registry UninstallString values.
+
+    #[test]
+    fn quoted_program_keeps_arguments_verbatim() {
+        let (program, args) = split_command_line(
+            r#""C:\windows\SysWOW64\RunDll32.EXE" "C:\Program Files\NVIDIA Corporation\Installer2\InstallerCore\NVI2.DLL",UninstallPackage Display.Driver"#,
+        );
+        assert_eq!(program, r"C:\windows\SysWOW64\RunDll32.EXE");
+        // Quoting inside the argument string must survive — splitting on
+        // whitespace here is what broke the NVIDIA uninstallers.
+        assert_eq!(
+            args,
+            r#""C:\Program Files\NVIDIA Corporation\Installer2\InstallerCore\NVI2.DLL",UninstallPackage Display.Driver"#
+        );
+    }
+
+    #[test]
+    fn quoted_program_without_arguments() {
+        let (program, args) = split_command_line(r#""C:\Program Files\Audacity\unins000.exe""#);
+        assert_eq!(program, r"C:\Program Files\Audacity\unins000.exe");
+        assert_eq!(args, "");
+    }
+
+    #[test]
+    fn bare_command_falls_back_to_first_token() {
+        let (program, args) =
+            split_command_line(r#"CMD /C "C:\Program Files\HP\Documentation\Doc_Uninstall.cmd""#);
+        assert_eq!(program, "CMD");
+        assert_eq!(args, r#"/C "C:\Program Files\HP\Documentation\Doc_Uninstall.cmd""#);
+    }
+
+    #[test]
+    fn unquoted_path_with_spaces_resolves_against_disk() {
+        // The whole string is the program only when it exists on disk;
+        // otherwise the first token is used. Build the case with a real file.
+        let dir = std::env::temp_dir().join("storage doctor test dir");
+        let exe = dir.join("uninstall.exe");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(&exe, b"").unwrap();
+
+        let full = exe.to_string_lossy().into_owned();
+        let (program, args) = split_command_line(&full);
+        assert_eq!(program, full);
+        assert_eq!(args, "");
+
+        let (program, args) = split_command_line(&format!("{full} /S"));
+        assert_eq!(program, full);
+        assert_eq!(args, "/S");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn msi_product_code_only_matches_msiexec_programs() {
+        assert_eq!(
+            msi_product_code("MsiExec.exe /I{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}").as_deref(),
+            Some("{20C01991-CCD1-2C06-7A9A-B10A9B4AF807}")
+        );
+        assert_eq!(
+            msi_product_code(
+                r"msiexec.exe /x {AF599C42-A2E5-4251-B7EE-49251227A340} /L*V C:\Temp\hss.log"
+            )
+            .as_deref(),
+            Some("{AF599C42-A2E5-4251-B7EE-49251227A340}")
+        );
+        // A bundle uninstaller whose *path* contains a GUID is not an MSI.
+        assert_eq!(
+            msi_product_code(
+                r#""C:\ProgramData\Package Cache\{d8bbe9f9-7c5b-42c6-b715-9ee898a2e515}\VC_redist.x64.exe"  /uninstall"#
+            ),
+            None
+        );
+    }
+
+    /// End-to-end: an unquoted path containing spaces plus an argument, run
+    /// through the real `ShellExecuteEx` call. The target writes a marker file
+    /// so we can confirm it actually started with the argument intact.
+    #[test]
+    fn launches_a_command_with_spaces_in_its_path() {
+        let dir = std::env::temp_dir().join("storage doctor launch test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("uninstall.cmd");
+        let marker = dir.join("ran.txt");
+        std::fs::write(&script, "@echo off\r\necho %1> \"%~dp0ran.txt\"\r\n").unwrap();
+
+        let command = format!("{} MARKER-ARG", script.to_string_lossy());
+        launch_uninstaller(&command).expect("uninstaller should launch");
+
+        // The shell starts the process asynchronously; give it a moment.
+        let mut contents = String::new();
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(&marker) {
+                contents = text;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert!(
+            contents.contains("MARKER-ARG"),
+            "target did not run with its argument; marker contained {contents:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn missing_uninstaller_reports_the_stale_command() {
+        let err = launch_uninstaller(r"C:\No Such Dir\uninstall.exe /S").unwrap_err();
+        assert!(err.contains("no longer on disk"), "unexpected error: {err}");
+    }
+
+    /// Diagnostic: resolves every uninstall string in this machine's registry
+    /// and reports which ones the parser cannot point at a real program.
+    /// Run with `cargo test -- --ignored --nocapture audit`.
+    #[test]
+    #[ignore]
+    fn audit_every_installed_app() {
+        let apps = list_installed();
+        let mut msi = 0;
+        let mut resolved = 0;
+        let mut via_path = 0;
+        let mut unresolved: Vec<(String, String)> = Vec::new();
+
+        for app in &apps {
+            let Some(raw) = app.uninstall_string.as_deref() else {
+                continue;
+            };
+            let expanded = expand_env_vars(raw.trim());
+            let s = expanded.trim();
+            if msi_product_code(s).is_some() {
+                msi += 1;
+                continue;
+            }
+            let (program, _) = split_command_line(s);
+            if std::path::Path::new(&program).is_file() {
+                resolved += 1;
+            } else if !(program.contains(":\\") || program.starts_with("\\\\")) {
+                // Bare command such as `CMD` — the shell resolves it via PATH.
+                via_path += 1;
+            } else {
+                unresolved.push((app.name.clone(), raw.to_string()));
+            }
+        }
+
+        println!("\n=== uninstall string audit ===");
+        println!("total apps with an uninstall string: {}", msi + resolved + via_path + unresolved.len());
+        println!("  msi (msiexec /x GUID):   {msi}");
+        println!("  resolved to a real file: {resolved}");
+        println!("  bare command via PATH:   {via_path}");
+        println!("  UNRESOLVED:              {}", unresolved.len());
+        for (name, raw) in &unresolved {
+            println!("    - {name}\n        {raw}");
+        }
+    }
+
+    #[test]
+    fn env_vars_are_expanded_and_stray_percents_kept() {
+        std::env::set_var("STORAGE_DOCTOR_TEST_VAR", r"C:\Apps");
+        assert_eq!(
+            expand_env_vars(r"%STORAGE_DOCTOR_TEST_VAR%\uninstall.exe"),
+            r"C:\Apps\uninstall.exe"
+        );
+        assert_eq!(expand_env_vars("50% off"), "50% off");
+        assert_eq!(
+            expand_env_vars("%NOT_A_REAL_VAR_12345%\\x"),
+            "%NOT_A_REAL_VAR_12345%\\x"
+        );
+    }
 }

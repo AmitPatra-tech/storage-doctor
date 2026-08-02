@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { EyeOff, FolderOpen, Trash2 } from "lucide-react";
 import { backend } from "@/lib/backend";
+import { refreshAfterCleanup } from "@/lib/refresh";
 import { formatBytes } from "@/lib/utils";
 import { RiskBadge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -45,8 +46,7 @@ export function Recommendations() {
     setTarget(null);
     // Re-measure so cleaned recommendations drop off / update their size.
     await backend.regenerateRecommendations();
-    queryClient.invalidateQueries({ queryKey: ["recommendations"] });
-    queryClient.invalidateQueries({ queryKey: ["lastScan"] });
+    refreshAfterCleanup(queryClient);
   };
 
   return (

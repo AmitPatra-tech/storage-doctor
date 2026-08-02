@@ -20,6 +20,10 @@ export interface FolderEntry {
   name: string;
   sizeBytes: number;
   fileCount: number;
+  /** How much of sizeBytes is safe to clear — 0 means the cleanup action has
+   *  nothing to offer for this row. `null` means a scan taken before this was
+   *  measured, which is not the same as zero. */
+  recoverableBytes: number | null;
   classification?: Classification | null;
 }
 
@@ -29,7 +33,16 @@ export interface BrowseEntry {
   isDir: boolean;
   sizeBytes: number;
   fileCount: number;
+  recoverableBytes: number;
   classification?: Classification | null;
+}
+
+/** A folder measured on demand, filling a gap the last scan left. */
+export interface FolderMeasurement {
+  path: string;
+  sizeBytes: number;
+  fileCount: number;
+  recoverableBytes: number;
 }
 
 export interface FolderDelta {
@@ -87,8 +100,14 @@ export interface DeleteResult {
 }
 
 export interface SearchProgress {
+  /** The query these results belong to — late events from a superseded
+   *  search are ignored rather than mixed into the current result list. */
+  query: string;
   found: number;
   done: boolean;
+  /** Matches found since the previous event, so results appear while the
+   *  drives are still being walked. */
+  items: SearchResultItem[];
 }
 
 export interface License {
@@ -164,6 +183,7 @@ export interface InstalledApp {
   installLocation: string | null;
   estimatedBytes: number;
   uninstallString: string | null;
+  displayIcon: string | null;
 }
 
 export interface Leftover {

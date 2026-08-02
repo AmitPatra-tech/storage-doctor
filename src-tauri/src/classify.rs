@@ -27,6 +27,13 @@ const CACHE_NAMES: &[&str] = &[
 
 const LOG_NAMES: &[&str] = &["logs", "log", "crashdumps", "minidump", "livekernelreports", "crash reports"];
 
+/// The safety verdict alone — `safe`, `review`, `personal`, `apps`, `system`.
+/// Every screen that reports recoverable space must agree on this, so they all
+/// route through here rather than re-deriving it.
+pub fn safety(path: &Path, is_dir: bool) -> Option<String> {
+    classify(path, is_dir).map(|c| c.safety)
+}
+
 /// Explains what a folder or file is and whether deleting it is safe.
 /// Returns None when nothing meaningful can be said.
 pub fn classify(path: &Path, is_dir: bool) -> Option<Classification> {

@@ -18,3 +18,20 @@ export function formatPercent(part: number, whole: number): string {
   if (whole <= 0) return "0%";
   return `${((part / whole) * 100).toFixed(1)}%`;
 }
+
+/** "just now" / "3 hours ago" / "2 days ago" — used to date scan results so a
+ *  stored size is never mistaken for a live one. */
+export function formatRelativeTime(iso: string): string {
+  // SQLite's datetime('now') has no timezone marker but is always UTC.
+  const stamp = /[Zz]|[+-]\d{2}:?\d{2}$/.test(iso) ? iso : `${iso.replace(" ", "T")}Z`;
+  const then = new Date(stamp).getTime();
+  if (Number.isNaN(then)) return "recently";
+
+  const minutes = Math.round((Date.now() - then) / 60_000);
+  if (minutes < 1) return "just now";
+  if (minutes < 60) return `${minutes} minute${minutes === 1 ? "" : "s"} ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours} hour${hours === 1 ? "" : "s"} ago`;
+  const days = Math.round(hours / 24);
+  return `${days} day${days === 1 ? "" : "s"} ago`;
+}

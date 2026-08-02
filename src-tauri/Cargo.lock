@@ -3241,8 +3241,10 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 name = "storage-doctor"
 version = "1.0.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "dirs 5.0.1",
+ "png 0.17.16",
  "rayon",
  "rusqlite",
  "serde",
@@ -3256,6 +3258,8 @@ dependencies = [
  "tauri-plugin-updater",
  "thiserror 2.0.18",
  "trash",
+ "windows 0.61.3",
+ "windows-sys 0.59.0",
  "winreg",
 ]
 

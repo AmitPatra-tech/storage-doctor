@@ -5,6 +5,7 @@ import type {
   DriveInfo,
   DupeGroup,
   DupeProgress,
+  FolderMeasurement,
   InstalledApp,
   Leftover,
   License,
@@ -53,11 +54,13 @@ const mockScan: ScanSummary = {
   durationMs: 74_000,
   drives: mockDrives,
   largestFolders: [
-    { path: "C:\\Users", name: "Users", sizeBytes: 182 * 2 ** 30, fileCount: 412_331 },
-    { path: "C:\\Program Files", name: "Program Files", sizeBytes: 96 * 2 ** 30, fileCount: 158_204 },
-    { path: "C:\\Windows", name: "Windows", sizeBytes: 41 * 2 ** 30, fileCount: 210_887 },
-    { path: "C:\\ProgramData", name: "ProgramData", sizeBytes: 22 * 2 ** 30, fileCount: 64_112 },
-    { path: "C:\\Users\\me\\Downloads", name: "Downloads", sizeBytes: 19 * 2 ** 30, fileCount: 1_204 },
+    { path: "C:\\Users", name: "Users", sizeBytes: 182 * 2 ** 30, fileCount: 412_331, recoverableBytes: 4.2 * 2 ** 30 },
+    { path: "C:\\Program Files", name: "Program Files", sizeBytes: 96 * 2 ** 30, fileCount: 158_204, recoverableBytes: 0 },
+    { path: "C:\\Windows", name: "Windows", sizeBytes: 41 * 2 ** 30, fileCount: 210_887, recoverableBytes: 0 },
+    // Deliberately unmeasured, so the on-demand measurement path is visible
+    // in browser dev the same way a pre-upgrade scan behaves.
+    { path: "C:\\ProgramData", name: "ProgramData", sizeBytes: 22 * 2 ** 30, fileCount: 64_112, recoverableBytes: null },
+    { path: "C:\\Users\\me\\Downloads", name: "Downloads", sizeBytes: 19 * 2 ** 30, fileCount: 1_204, recoverableBytes: 0 },
   ],
   largestFiles: [
     {
@@ -156,6 +159,7 @@ export type Unsubscribe = () => void;
 // Mock event plumbing so the scan flow is testable in a plain browser.
 const mockProgressListeners = new Set<(p: ScanProgress) => void>();
 const mockCompleteListeners = new Set<(c: ScanComplete) => void>();
+const mockMeasuredListeners = new Set<(m: FolderMeasurement) => void>();
 
 function runMockScan() {
   let files = 0;
@@ -259,6 +263,7 @@ export const backend = {
           isDir: true,
           sizeBytes: 3.2 * 2 ** 30,
           fileCount: 12_400,
+          recoverableBytes: 3.2 * 2 ** 30,
           classification: {
             category: "Cache",
             safety: "safe",
@@ -271,6 +276,7 @@ export const backend = {
           isDir: true,
           sizeBytes: 1.1 * 2 ** 30,
           fileCount: 840,
+          recoverableBytes: 0,
           classification: {
             category: "Personal files",
             safety: "personal",
@@ -283,11 +289,39 @@ export const backend = {
           isDir: false,
           sizeBytes: 0.4 * 2 ** 30,
           fileCount: 1,
+          recoverableBytes: 0,
           classification: null,
         },
       ];
     }
     return invoke<BrowseEntry[]>("browse_folder", { path });
+  },
+
+  /** Measures folders the last scan left unmeasured. Results arrive one at
+   *  a time via `onFolderMeasured`; this resolves when all are done. */
+  async measureRecoverable(paths: string[]): Promise<void> {
+    if (paths.length === 0) return;
+    if (!isTauri) {
+      // Emit one at a time, as the real walk does.
+      for (const path of paths) {
+        await new Promise((r) => setTimeout(r, 600));
+        mockMeasuredListeners.forEach((cb) =>
+          cb({ path, sizeBytes: 22 * 2 ** 30, fileCount: 64_112, recoverableBytes: 1.1 * 2 ** 30 })
+        );
+      }
+      return;
+    }
+    return invoke("measure_recoverable", { paths });
+  },
+
+  async onFolderMeasured(
+    cb: (m: FolderMeasurement) => void
+  ): Promise<Unsubscribe> {
+    if (!isTauri) {
+      mockMeasuredListeners.add(cb);
+      return () => mockMeasuredListeners.delete(cb);
+    }
+    return listenTauri<FolderMeasurement>("folder-measured", cb);
   },
 
   async getScanComparison(): Promise<ScanComparison | null> {
@@ -321,6 +355,7 @@ export const backend = {
           installLocation: "C:\\Program Files\\Google\\Chrome\\Application",
           estimatedBytes: 650 * 2 ** 20,
           uninstallString: "mock",
+          displayIcon: null,
         },
         {
           name: "7-Zip 23.01 (x64)",
@@ -329,10 +364,29 @@ export const backend = {
           installLocation: "C:\\Program Files\\7-Zip",
           estimatedBytes: 5 * 2 ** 20,
           uninstallString: "mock",
+          displayIcon: null,
         },
       ];
     }
     return invoke<InstalledApp[]>("get_installed_apps");
+  },
+
+  /** PNG data URIs for the given files, keyed by path. Images and videos get a
+   *  real content thumbnail; other files get their file-type icon. Paths that
+   *  cannot be rendered are absent from the map. */
+  async getThumbnails(
+    paths: string[],
+    size = 64,
+    iconOnly = false
+  ): Promise<Record<string, string>> {
+    if (!isTauri || paths.length === 0) return {};
+    return invoke<Record<string, string>>("get_thumbnails", { paths, size, iconOnly });
+  },
+
+  /** Application logos, keyed by application name. */
+  async getAppIcons(apps: InstalledApp[], size = 32): Promise<Record<string, string>> {
+    if (!isTauri || apps.length === 0) return {};
+    return invoke<Record<string, string>>("get_app_icons", { apps, size });
   },
 
   async launchUninstaller(uninstallString: string): Promise<void> {
@@ -538,6 +592,12 @@ export const backend = {
       ].filter((r) => r.name.toLowerCase().includes(q));
     }
     return invoke<SearchResultItem[]>("search_files", { query });
+  },
+
+  /** Abandons the running deep search (new query, or the user gave up). */
+  async cancelSearch(): Promise<void> {
+    if (!isTauri) return;
+    return invoke("cancel_search");
   },
 
   async revealInExplorer(path: string): Promise<void> {

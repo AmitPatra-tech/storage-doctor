@@ -44,6 +44,8 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             name TEXT NOT NULL,
             size_bytes INTEGER NOT NULL,
             file_count INTEGER NOT NULL,
+            recoverable_bytes INTEGER NOT NULL DEFAULT 0,
+            recoverable_measured INTEGER NOT NULL DEFAULT 0,
             depth INTEGER NOT NULL DEFAULT 0
         );
         CREATE INDEX IF NOT EXISTS idx_folders_scan_size
@@ -90,6 +92,17 @@ fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 
     // Best-effort column additions for databases created by earlier builds.
     let _ = conn.execute("ALTER TABLE folders ADD COLUMN depth INTEGER NOT NULL DEFAULT 0", []);
+    let _ = conn.execute(
+        "ALTER TABLE folders ADD COLUMN recoverable_bytes INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
+    // Adding the column above backfills every existing row with 0, which is
+    // indistinguishable from "nothing to clear". Tracked per row rather than
+    // per scan because folders are also measured on demand, one at a time.
+    let _ = conn.execute(
+        "ALTER TABLE folders ADD COLUMN recoverable_measured INTEGER NOT NULL DEFAULT 0",
+        [],
+    );
     let _ = conn.execute("ALTER TABLE recommendations ADD COLUMN paths TEXT", []);
     Ok(())
 }

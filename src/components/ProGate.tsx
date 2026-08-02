@@ -36,8 +36,8 @@ export function UpgradePanel({ feature }: { feature: string }) {
           <h3 className="text-base font-semibold">{feature} is a Pro feature</h3>
           <p className="mx-auto mt-1 max-w-md text-sm text-muted">
             Upgrade to Storage Doctor Pro to unlock the duplicate finder and exportable
-            PDF cleanup reports — a {CONFIG.proPriceLabel} that keeps future premium
-            updates.
+            PDF cleanup reports — a {CONFIG.proPriceLabel} purchase that includes future
+            premium updates.
           </p>
         </div>
 

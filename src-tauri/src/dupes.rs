@@ -27,7 +27,7 @@ pub struct DupeProgress {
     pub bytes_hashed: u64,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DupeFile {
     pub path: String,
@@ -106,17 +106,25 @@ fn modified_rfc3339(path: &Path) -> String {
 }
 
 pub fn find(app: AppHandle, roots: Vec<PathBuf>) -> Vec<DupeGroup> {
+    find_with_progress(roots, &|progress| {
+        let _ = app.emit("dupe-progress", progress);
+    })
+}
+
+/// Core duplicate detection. Progress is delivered through a callback so the
+/// algorithm can be exercised without a Tauri app handle.
+pub fn find_with_progress(
+    roots: Vec<PathBuf>,
+    on_progress: &(dyn Fn(DupeProgress) + Sync),
+) -> Vec<DupeGroup> {
     let roots = if roots.is_empty() { default_roots() } else { roots };
 
-    let _ = app.emit(
-        "dupe-progress",
-        DupeProgress {
-            phase: "collecting".into(),
-            files_processed: 0,
-            total_files: 0,
-            bytes_hashed: 0,
-        },
-    );
+    on_progress(DupeProgress {
+        phase: "collecting".into(),
+        files_processed: 0,
+        total_files: 0,
+        bytes_hashed: 0,
+    });
 
     let mut files: Vec<(PathBuf, u64)> = Vec::new();
     for root in &roots {
@@ -143,15 +151,12 @@ pub fn find(app: AppHandle, roots: Vec<PathBuf>) -> Vec<DupeGroup> {
             return;
         }
         *last = Instant::now();
-        let _ = app.emit(
-            "dupe-progress",
-            DupeProgress {
-                phase: "hashing".into(),
-                files_processed: processed.load(Ordering::Relaxed),
-                total_files,
-                bytes_hashed: bytes.load(Ordering::Relaxed),
-            },
-        );
+        on_progress(DupeProgress {
+            phase: "hashing".into(),
+            files_processed: processed.load(Ordering::Relaxed),
+            total_files,
+            bytes_hashed: bytes.load(Ordering::Relaxed),
+        });
     };
 
     let mut groups: Vec<DupeGroup> = candidates
@@ -192,15 +197,12 @@ pub fn find(app: AppHandle, roots: Vec<PathBuf>) -> Vec<DupeGroup> {
     groups.sort_by_key(|g| std::cmp::Reverse(g.size_bytes * (g.files.len() as u64 - 1)));
     groups.truncate(MAX_GROUPS);
 
-    let _ = app.emit(
-        "dupe-progress",
-        DupeProgress {
-            phase: "done".into(),
-            files_processed: total_files,
-            total_files,
-            bytes_hashed: bytes.load(Ordering::Relaxed),
-        },
-    );
+    on_progress(DupeProgress {
+        phase: "done".into(),
+        files_processed: total_files,
+        total_files,
+        bytes_hashed: bytes.load(Ordering::Relaxed),
+    });
 
     groups
 }
@@ -219,5 +221,57 @@ fn make_group(hash: String, size_bytes: u64, paths: &[&PathBuf]) -> DupeGroup {
         hash: hash[..16].to_string(),
         size_bytes,
         files,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(dir: &Path, name: &str, byte: u8, len: usize) -> PathBuf {
+        let path = dir.join(name);
+        fs::write(&path, vec![byte; len]).unwrap();
+        path
+    }
+
+    /// Small files are in scope: MIN_SIZE is 1 byte, so 100 B and 100 KB
+    /// duplicates are detected just like large ones. Only 0-byte files are
+    /// skipped (every empty file is trivially "identical" — pure noise).
+    #[test]
+    fn detects_small_duplicates_and_skips_empty_files() {
+        let dir = std::env::temp_dir().join("storage doctor dupes test");
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // 100 bytes, identical pair.
+        write(&dir, "tiny-a.bin", 0xAA, 100);
+        write(&dir, "tiny-b.bin", 0xAA, 100);
+        // 100 KB, identical pair.
+        write(&dir, "small-a.bin", 0xBB, 100 * 1024);
+        write(&dir, "small-b.bin", 0xBB, 100 * 1024);
+        // Same size as the 100-byte pair but different content — must not group.
+        write(&dir, "tiny-different.bin", 0xCC, 100);
+        // Empty files are deliberately ignored.
+        write(&dir, "empty-a.bin", 0x00, 0);
+        write(&dir, "empty-b.bin", 0x00, 0);
+
+        let groups = find_with_progress(vec![dir.clone()], &|_| {});
+
+        let sizes: Vec<u64> = groups.iter().map(|g| g.size_bytes).collect();
+        assert!(sizes.contains(&100), "100-byte duplicates not detected: {sizes:?}");
+        assert!(
+            sizes.contains(&(100 * 1024)),
+            "100 KB duplicates not detected: {sizes:?}"
+        );
+        assert!(!sizes.contains(&0), "empty files should not be grouped: {sizes:?}");
+
+        // Each group holds exactly the two identical copies — the same-size
+        // file with different content is excluded.
+        for group in &groups {
+            assert_eq!(group.files.len(), 2, "unexpected group {:?}", group.files);
+        }
+        assert_eq!(groups.len(), 2, "expected exactly two groups");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

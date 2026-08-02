@@ -1,11 +1,12 @@
 mod apps;
 mod classify;
-mod cleaner;
+pub mod cleaner;
 mod commands;
 mod db;
 mod dupes;
 mod recommendations;
-mod scanner;
+pub mod scanner;
+mod thumbs;
 mod uninstall;
 
 use std::sync::Mutex;
@@ -32,17 +33,21 @@ pub fn run() {
             commands::regenerate_recommendations,
             commands::set_recommendation_ignored,
             commands::browse_folder,
+            commands::measure_recoverable,
             commands::get_scan_comparison,
             commands::get_app_usage,
             commands::get_installed_apps,
             commands::launch_uninstaller,
             commands::find_app_leftovers,
+            commands::get_thumbnails,
+            commands::get_app_icons,
             commands::delete_paths,
             commands::delete_paths_elevated,
             commands::find_safe_cleanup,
             commands::find_duplicates,
             commands::search,
             commands::search_files,
+            commands::cancel_search,
             commands::get_operations,
             commands::get_license,
             commands::set_license,

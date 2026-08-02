@@ -12,7 +12,7 @@ export const CONFIG = {
   dodoMode: "live" as "test" | "live",
   dodoLiveProductId: "pdt_0NjSdjhwfCyngGGbuPzsN",
   dodoTestProductId: "pdt_0NjU7StVxETIrbHUVx8A0",
-  proPriceLabel: "₹59 one-time",
+  proPriceLabel: "$20 one-time",
   invoiceEmail: "mikarmiaura@gmail.com",
 };
 
