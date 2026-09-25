@@ -99,6 +99,30 @@ export interface DeleteResult {
   failed: string[];
 }
 
+export interface ForceDeleteResult {
+  freedBytes: number;
+  /** Removed immediately, once whatever had them open was closed. */
+  removed: string[];
+  /** Not free yet — Windows will remove these automatically the next time
+   *  the PC restarts, because nothing running right now could be made to
+   *  let go of them. */
+  scheduledForReboot: string[];
+  /** Genuinely could not be handled at all. */
+  failed: string[];
+}
+
+export interface ForceUninstallStep {
+  label: string;
+  ok: boolean;
+}
+
+export interface ForceUninstallReport {
+  steps: ForceUninstallStep[];
+  /** No matching registry entry and (if it had one) no install folder left —
+   *  the practical definition of "actually uninstalled now". */
+  complete: boolean;
+}
+
 export interface SearchProgress {
   /** The query these results belong to — late events from a superseded
    *  search are ignored rather than mixed into the current result list. */

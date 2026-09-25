@@ -2,7 +2,8 @@ use crate::apps::dir_size;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use sysinfo::System;
 use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
 use winreg::RegKey;
 
@@ -331,14 +332,13 @@ fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
 }
 
-/// Conservative search for folders an application leaves behind. Matches
-/// exact app-name folders, and `<Publisher>\<App>` two-level folders — never
-/// a bare publisher folder (it may hold other apps' data).
-pub fn find_leftovers(
-    name: &str,
-    publisher: &str,
-    install_location: Option<&str>,
-) -> Vec<Leftover> {
+/// Normalized name forms an app can plausibly appear under on disk: the full
+/// name, the name without version/arch suffixes ("Foo 2.3.1 (x64)" → "foo"),
+/// and — for a name like "Google Chrome" published by Google — the name with
+/// the publisher prefix dropped, since installers commonly use just "Chrome"
+/// for the folder or shortcut. Shared by leftover-folder, shortcut and
+/// process matching so all three agree on what counts as "this app".
+fn name_variants(name: &str, publisher: &str) -> Vec<String> {
     let base = base_name(name);
     let mut variants: Vec<String> = vec![norm(name), norm(&base)];
     let name_tokens: Vec<&str> = base.split_whitespace().collect();
@@ -349,6 +349,21 @@ pub fn find_leftovers(
     }
     variants.retain(|v| v.len() >= 3);
     variants.dedup();
+    variants
+}
+
+/// Conservative search for folders an application leaves behind. Matches
+/// exact app-name folders, and `<Publisher>\<App>` two-level folders — never
+/// a bare publisher folder (it may hold other apps' data).
+pub fn find_leftovers(
+    name: &str,
+    publisher: &str,
+    install_location: Option<&str>,
+) -> Vec<Leftover> {
+    let variants = name_variants(name, publisher);
+    let base = base_name(name);
+    let name_tokens: Vec<&str> = base.split_whitespace().collect();
+    let publisher_first = publisher.split_whitespace().next().map(norm).unwrap_or_default();
 
     let single_roots = [
         env_path("LOCALAPPDATA"),
@@ -423,9 +438,474 @@ pub fn find_leftovers(
     leftovers
 }
 
+// ---------------------------------------------------------------------------
+// Force uninstall — for apps whose own uninstaller is missing, broken, or
+// (Microsoft Edge being the textbook case) refuses to run through the usual
+// path. Mirrors what a third-party tool like Revo Uninstaller does in its
+// "forced" mode: stop whatever is running, then remove the program, its
+// registry entry and its shortcuts directly — no longer waiting on the
+// vendor's own uninstaller to cooperate.
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ForceStep {
+    pub label: String,
+    pub ok: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ForceUninstallReport {
+    pub steps: Vec<ForceStep>,
+    /// No matching registry entry and (if it had one) no install folder left
+    /// — the practical definition of "actually uninstalled now". Leftover
+    /// data and shortcuts are cleaned up too but do not gate this.
+    pub complete: bool,
+}
+
+/// Background processes to stop that a plain install-folder match would
+/// miss — updaters and helpers that run from a separate location.
+fn known_process_names(name: &str) -> &'static [&'static str] {
+    let n = norm(name);
+    if n.contains("microsoftedge") {
+        &["msedge.exe", "msedgewebview2.exe", "identity_helper.exe", "MicrosoftEdgeUpdate.exe"]
+    } else if n.contains("googlechrome") {
+        &["chrome.exe", "GoogleUpdate.exe", "elevation_service.exe"]
+    } else if n.contains("mozillafirefox") {
+        &["firefox.exe"]
+    } else {
+        &[]
+    }
+}
+
+/// True if any process matching this app is currently running: launched from
+/// its install folder, or one of its known background helpers.
+fn any_related_process_running(app: &InstalledApp) -> bool {
+    let sys = System::new_all();
+    let install_dir = install_dir_of(app);
+    let known = known_process_names(&app.name);
+    sys.processes().values().any(|process| {
+        let name = process.name().to_string_lossy().to_string();
+        let under_install_dir = install_dir
+            .as_deref()
+            .zip(process.exe())
+            .map(|(dir, exe)| exe.starts_with(dir))
+            .unwrap_or(false);
+        under_install_dir || known.iter().any(|k| k.eq_ignore_ascii_case(&name))
+    })
+}
+
+/// Stops every process matching this app — works without administrator
+/// rights for processes the signed-in user owns, which covers ordinary
+/// desktop apps even when installed machine-wide. Best effort: callers
+/// re-check `any_related_process_running` rather than trusting this.
+fn stop_related_processes(app: &InstalledApp) {
+    let sys = System::new_all();
+    let install_dir = install_dir_of(app);
+    let known = known_process_names(&app.name);
+    for process in sys.processes().values() {
+        let name = process.name().to_string_lossy().to_string();
+        let under_install_dir = install_dir
+            .as_deref()
+            .zip(process.exe())
+            .map(|(dir, exe)| exe.starts_with(dir))
+            .unwrap_or(false);
+        if under_install_dir || known.iter().any(|k| k.eq_ignore_ascii_case(&name)) {
+            process.kill();
+        }
+    }
+}
+
+fn install_dir_of(app: &InstalledApp) -> Option<PathBuf> {
+    app.install_location
+        .as_deref()
+        .map(|s| s.trim().trim_matches('"'))
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Everything this app's continued presence can be checked against: its own
+/// install folder plus whatever `find_leftovers` would still find.
+fn remaining_paths(app: &InstalledApp) -> Vec<PathBuf> {
+    let mut paths: Vec<PathBuf> = install_dir_of(app).into_iter().filter(|p| p.exists()).collect();
+    paths.extend(
+        find_leftovers(&app.name, &app.publisher, app.install_location.as_deref())
+            .into_iter()
+            .map(|l| PathBuf::from(l.path)),
+    );
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+/// Re-locates every registry Uninstall subkey whose DisplayName matches
+/// exactly (a 32-bit and 64-bit entry can coexist under the same name), so
+/// the app's own entry can be removed once nothing is left of it.
+fn find_uninstall_key_paths(display_name: &str) -> Vec<(&'static str, String)> {
+    let mut found = Vec::new();
+    for (hive, path) in UNINSTALL_PATHS {
+        let root = match *hive {
+            "HKLM" => RegKey::predef(HKEY_LOCAL_MACHINE),
+            _ => RegKey::predef(HKEY_CURRENT_USER),
+        };
+        let Ok(key) = root.open_subkey(path) else {
+            continue;
+        };
+        for sub_name in key.enum_keys().flatten() {
+            let Ok(sub) = key.open_subkey(&sub_name) else {
+                continue;
+            };
+            let Ok(name) = sub.get_value::<String, _>("DisplayName") else {
+                continue;
+            };
+            if name.trim() == display_name {
+                found.push((*hive, format!("{path}\\{sub_name}")));
+            }
+        }
+    }
+    found
+}
+
+/// Start Menu (current user and all users) and Desktop (current user and
+/// Public) — every place Windows itself puts a shortcut for an installed app.
+fn shortcut_dirs() -> Vec<PathBuf> {
+    [
+        env_path("ProgramData").map(|p| p.join(r"Microsoft\Windows\Start Menu\Programs")),
+        env_path("APPDATA").map(|p| p.join(r"Microsoft\Windows\Start Menu\Programs")),
+        env_path("Public").map(|p| p.join("Desktop")),
+        env_path("USERPROFILE").map(|p| p.join("Desktop")),
+    ]
+    .into_iter()
+    .flatten()
+    .collect()
+}
+
+fn walk_shortcuts(dir: &Path, variants: &[String], out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            walk_shortcuts(&path, variants, out);
+            continue;
+        }
+        let is_shortcut = path
+            .extension()
+            .map(|e| e.eq_ignore_ascii_case("lnk") || e.eq_ignore_ascii_case("url"))
+            .unwrap_or(false);
+        if !is_shortcut {
+            continue;
+        }
+        let stem = norm(&path.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+        // Exact match only: Explorer names a shortcut after the app's
+        // DisplayName, and a fuzzy match here risks catching an unrelated
+        // shortcut that merely contains the same short word.
+        if variants.contains(&stem) {
+            out.push(path);
+        }
+    }
+}
+
+/// Shortcuts (Start Menu, Desktop — current user and all users) matching this
+/// app by filename. Reading a `.lnk`'s actual target needs COM
+/// (`IShellLink`); a name match is what Explorer's own "Pin to Start"
+/// already relies on, and is enough for something about to be uninstalled.
+fn find_shortcuts(name: &str, publisher: &str) -> Vec<PathBuf> {
+    let variants = name_variants(name, publisher);
+    let mut out = Vec::new();
+    for dir in shortcut_dirs() {
+        walk_shortcuts(&dir, &variants, &mut out);
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn is_edge(name: &str) -> bool {
+    norm(name) == "microsoftedge"
+}
+
+fn parse_version(s: &str) -> Option<Vec<u32>> {
+    let parts: Result<Vec<u32>, _> = s.split('.').map(str::parse).collect();
+    parts.ok().filter(|p: &Vec<u32>| !p.is_empty())
+}
+
+fn newest_edge_setup(app_dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(app_dir).ok()?;
+    let mut best: Option<(Vec<u32>, PathBuf)> = None;
+    for entry in entries.flatten() {
+        if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(version) = parse_version(&name) else {
+            continue;
+        };
+        let setup = entry.path().join("Installer").join("setup.exe");
+        if !setup.is_file() {
+            continue;
+        }
+        if best.as_ref().map(|(v, _)| version > *v).unwrap_or(true) {
+            best = Some((version, setup));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// Locates Microsoft Edge's own uninstaller. Edge does not remove itself
+/// through a plain `UninstallString` — it insists on `setup.exe --uninstall`,
+/// run from inside its own versioned application folder, which is exactly
+/// why "the uninstaller won't run" is the standard complaint about Edge.
+/// Checked machine-wide first (the common case for Edge), then per-user.
+/// Returns whether the install found is machine-wide (needs administrator
+/// rights to remove).
+fn edge_setup_exe() -> Option<(PathBuf, bool)> {
+    for base in [env_path("ProgramFiles(x86)"), env_path("ProgramFiles")]
+        .into_iter()
+        .flatten()
+    {
+        if let Some(setup) = newest_edge_setup(&base.join(r"Microsoft\Edge\Application")) {
+            return Some((setup, true));
+        }
+    }
+    if let Some(base) = env_path("LOCALAPPDATA") {
+        if let Some(setup) = newest_edge_setup(&base.join(r"Microsoft\Edge\Application")) {
+            return Some((setup, false));
+        }
+    }
+    None
+}
+
+/// Runs a program and waits for it to finish — used for the per-user Edge
+/// uninstaller, which needs no elevation. Edge's own flags are all bare
+/// tokens, so a naive whitespace split is safe here (unlike the general
+/// uninstall-string parsing above, which has to handle quoted paths).
+fn run_and_wait(program: &Path, args: &str) -> Result<(), String> {
+    std::process::Command::new(program)
+        .args(args.split_whitespace())
+        .status()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
+/// Sends a file or folder to the Recycle Bin — a forced uninstall is still
+/// not a reason to make a mistake unrecoverable, matching how every other
+/// deletion in this app behaves.
+fn trash_path(path: &Path) {
+    let _ = trash::delete(path);
+}
+
+/// Builds the step report by checking real, current state — never by
+/// trusting what a removal attempt claimed to do. `attempted_edge` controls
+/// whether the Edge-specific step is shown at all (only relevant when this
+/// pass actually tried it).
+pub fn verify_force_uninstall(app: &InstalledApp, attempted_edge: bool) -> ForceUninstallReport {
+    let mut steps = vec![ForceStep {
+        label: "Closed running processes".into(),
+        ok: !any_related_process_running(app),
+    }];
+    if attempted_edge {
+        steps.push(ForceStep {
+            label: "Ran Microsoft Edge's own uninstaller".into(),
+            ok: edge_setup_exe().is_none(),
+        });
+    }
+    let remaining = remaining_paths(app);
+    steps.push(ForceStep {
+        label: "Removed the program's files".into(),
+        ok: remaining.is_empty(),
+    });
+    let registry_gone = find_uninstall_key_paths(&app.name).is_empty();
+    steps.push(ForceStep {
+        label: "Removed it from Installed Apps".into(),
+        ok: registry_gone,
+    });
+    steps.push(ForceStep {
+        label: "Removed shortcuts".into(),
+        ok: find_shortcuts(&app.name, &app.publisher).is_empty(),
+    });
+
+    let complete = registry_gone && install_dir_of(app).map(|p| !p.exists()).unwrap_or(true);
+    ForceUninstallReport { steps, complete }
+}
+
+/// Best-effort force removal without administrator rights: stops related
+/// processes, removes the install folder and any leftovers, the registry
+/// entry and shortcuts. Succeeds outright for per-user installs; whatever a
+/// machine-wide install still needs elevation for is left for
+/// `build_force_uninstall_script` to finish.
+pub fn force_uninstall(app: &InstalledApp) -> ForceUninstallReport {
+    stop_related_processes(app);
+    // Give processes a moment to actually exit before touching their files.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+
+    // Edge's per-user install needs no elevation; the machine-wide one is
+    // left for the elevated pass rather than prompting for UAC twice.
+    let mut attempted_edge = false;
+    if is_edge(&app.name) {
+        if let Some((setup, system_level)) = edge_setup_exe() {
+            if !system_level {
+                attempted_edge = true;
+                let _ = run_and_wait(&setup, "--uninstall --force-uninstall --verbose-logging");
+            }
+        }
+    }
+
+    for path in remaining_paths(app) {
+        trash_path(&path);
+    }
+    for (hive, path) in find_uninstall_key_paths(&app.name) {
+        let root = match hive {
+            "HKLM" => RegKey::predef(HKEY_LOCAL_MACHINE),
+            _ => RegKey::predef(HKEY_CURRENT_USER),
+        };
+        let _ = root.delete_subkey_all(&path);
+    }
+    for shortcut in find_shortcuts(&app.name, &app.publisher) {
+        trash_path(&shortcut);
+    }
+
+    verify_force_uninstall(app, attempted_edge)
+}
+
+/// One item's removal, sent to the Recycle Bin like every other deletion in
+/// this app rather than wiped outright.
+fn recycle_item_script(path: &Path) -> String {
+    let esc = path.to_string_lossy().replace('\'', "''");
+    format!(
+        "try {{ if (Test-Path -LiteralPath '{esc}' -PathType Container) {{ \
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('{esc}','OnlyErrorDialogs','SendToRecycleBin') \
+         }} elseif (Test-Path -LiteralPath '{esc}') {{ \
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('{esc}','OnlyErrorDialogs','SendToRecycleBin') \
+         }} }} catch {{ }}\n"
+    )
+}
+
+/// Assembles the PowerShell script that finishes whatever `force_uninstall`
+/// could not do without administrator rights: stop processes again
+/// (defensive — a process owned by another session may have survived the
+/// first pass), run Edge's machine-wide uninstaller if this is Edge, then
+/// remove the install folder, leftovers, registry entry and shortcuts.
+/// Returns the script together with whether it attempts the Edge step, so
+/// the caller's step report can match. Pure — runs no privileged code
+/// itself; `commands::run_elevated_powershell` executes what this builds.
+pub fn build_force_uninstall_script(app: &InstalledApp) -> (String, bool) {
+    let mut script = String::from("Add-Type -AssemblyName Microsoft.VisualBasic\n");
+
+    for name in known_process_names(&app.name) {
+        let base = name.trim_end_matches(".exe").replace('\'', "''");
+        script.push_str(&format!(
+            "Stop-Process -Name '{base}' -Force -ErrorAction SilentlyContinue\n"
+        ));
+    }
+    if let Some(dir) = install_dir_of(app) {
+        let esc = dir.to_string_lossy().replace('\'', "''");
+        script.push_str(&format!(
+            "Get-Process | Where-Object {{ $_.Path -like '{esc}\\*' }} | Stop-Process -Force -ErrorAction SilentlyContinue\n"
+        ));
+    }
+    script.push_str("Start-Sleep -Milliseconds 500\n");
+
+    let mut attempted_edge = false;
+    if is_edge(&app.name) {
+        if let Some((setup, _)) = edge_setup_exe() {
+            attempted_edge = true;
+            let esc = setup.to_string_lossy().replace('\'', "''");
+            script.push_str(&format!(
+                "try {{ Start-Process -FilePath '{esc}' \
+                 -ArgumentList '--uninstall','--system-level','--verbose-logging','--force-uninstall' \
+                 -Wait -ErrorAction SilentlyContinue }} catch {{ }}\n"
+            ));
+        }
+    }
+
+    for path in remaining_paths(app) {
+        script.push_str(&recycle_item_script(&path));
+    }
+    for (hive, path) in find_uninstall_key_paths(&app.name) {
+        let root = match hive {
+            "HKLM" => "HKEY_LOCAL_MACHINE",
+            _ => "HKEY_CURRENT_USER",
+        };
+        let esc = path.replace('\'', "''");
+        script.push_str(&format!(
+            "Remove-Item -Path 'Registry::{root}\\{esc}' -Recurse -Force -ErrorAction SilentlyContinue\n"
+        ));
+    }
+    for shortcut in find_shortcuts(&app.name, &app.publisher) {
+        script.push_str(&recycle_item_script(&shortcut));
+    }
+
+    (script, attempted_edge)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_variants_drops_publisher_prefix_and_short_tokens() {
+        let variants = name_variants("Google Chrome", "Google LLC");
+        assert!(variants.contains(&"googlechrome".to_string()));
+        assert!(variants.contains(&"chrome".to_string()));
+    }
+
+    #[test]
+    fn is_edge_matches_only_the_exact_display_name() {
+        assert!(is_edge("Microsoft Edge"));
+        // A near-miss must not be treated as Edge itself — running Edge's
+        // machine-wide force-uninstall command against the wrong product
+        // would be a serious mistake.
+        assert!(!is_edge("Microsoft Edge WebView2 Runtime"));
+        assert!(!is_edge("Notepad++"));
+    }
+
+    #[test]
+    fn parse_version_reads_dotted_numeric_folders() {
+        assert_eq!(parse_version("124.0.2478.51"), Some(vec![124, 0, 2478, 51]));
+        assert_eq!(parse_version("Installer"), None);
+        assert_eq!(parse_version(""), None);
+    }
+
+    /// The highest-versioned `Installer\setup.exe` must win, since that is
+    /// the one still valid to run — Edge leaves old version folders behind
+    /// after updating itself.
+    #[test]
+    fn newer_edge_version_folder_wins() {
+        let dir = std::env::temp_dir().join("storage doctor edge version test");
+        let _ = std::fs::remove_dir_all(&dir);
+        for version in ["120.0.100.1", "124.0.2478.51", "119.9.9.9"] {
+            let installer = dir.join(version).join("Installer");
+            std::fs::create_dir_all(&installer).unwrap();
+            std::fs::write(installer.join("setup.exe"), b"").unwrap();
+        }
+
+        let found = newest_edge_setup(&dir).expect("should find a setup.exe");
+        assert!(found.to_string_lossy().contains("124.0.2478.51"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The force-uninstall script must never target Edge's system-level
+    /// uninstaller for an app that merely has "edge" somewhere in its name —
+    /// only an exact match should trigger it.
+    #[test]
+    fn force_uninstall_script_only_runs_edges_own_uninstaller_for_edge_itself() {
+        let not_edge = InstalledApp {
+            name: "Notepad++".to_string(),
+            version: "8.6".to_string(),
+            publisher: "Don Ho".to_string(),
+            install_location: None,
+            estimated_bytes: 0,
+            uninstall_string: None,
+            display_icon: None,
+        };
+        let (script, attempted_edge) = build_force_uninstall_script(&not_edge);
+        assert!(!attempted_edge);
+        assert!(!script.contains("--system-level"));
+    }
 
     // Shapes taken verbatim from real registry UninstallString values.
 

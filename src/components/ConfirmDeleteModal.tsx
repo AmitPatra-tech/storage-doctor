@@ -1,5 +1,5 @@
-import { useEffect } from "react";
-import { ShieldAlert, Trash2 } from "lucide-react";
+import { useEffect, useState } from "react";
+import { Clock, ShieldAlert, Trash2, Zap } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
 import { Button } from "@/components/ui/button";
 import { SafetyBadge } from "@/components/ui/badge";
@@ -13,9 +13,17 @@ export interface DeleteItem {
   classification?: Classification | null;
 }
 
+/** Which retry, if any, has already been attempted — drives which failure
+ *  stage is shown, since an administrator retry and a force-delete retry
+ *  need different explanations and actions. */
+type Attempt = "none" | "elevated" | "force";
+
 /** Confirmation dialog that owns the deletion: moves items to the Recycle
- *  Bin, and if any fail (permission denied / locked) offers an
- *  administrator-elevated retry. Calls `onDone(freed)` when finished. */
+ *  Bin, and if any fail offers first an administrator-elevated retry, then —
+ *  for whatever is still locked open by something else even as
+ *  administrator — a force-delete retry that closes whatever has it open, or
+ *  schedules it for removal on the next restart. Calls `onDone(freed)` when
+ *  finished. */
 export function ConfirmDeleteModal({
   open,
   title,
@@ -38,10 +46,15 @@ export function ConfirmDeleteModal({
   onDone: (freedBytes: number) => void;
   onClose: () => void;
 }) {
-  const { busy, failed, freed, error, run, reset } = useSmartDelete();
+  const { busy, failed, scheduledForReboot, freed, error, run, forceDelete, reset } =
+    useSmartDelete();
+  const [attempt, setAttempt] = useState<Attempt>("none");
 
   useEffect(() => {
-    if (open) reset();
+    if (open) {
+      reset();
+      setAttempt("none");
+    }
   }, [open, reset]);
 
   const total = knownTotalBytes ?? items.reduce((sum, i) => sum + i.sizeBytes, 0);
@@ -54,10 +67,21 @@ export function ConfirmDeleteModal({
 
   const retryElevated = async () => {
     const res = await run(failed, true, source, permanent);
-    // Always close after the elevated attempt — remaining failures are locked
-    // files or directories that Windows recreated instantly.
-    onDone(freed + res.freedBytes);
+    setAttempt("elevated");
+    if (res.failed.length === 0) onDone(freed + res.freedBytes);
+    // Otherwise stay open: something is still locked open, which elevation
+    // alone cannot fix — offer Force Delete instead of silently giving up.
   };
+
+  const retryForce = async () => {
+    await forceDelete(failed, source, permanent);
+    setAttempt("force");
+    // Stay open regardless of outcome — a scheduled-for-reboot result is
+    // meaningfully different from "freed now" and deserves to be shown
+    // rather than folded silently into a single freed-bytes number.
+  };
+
+  const finish = () => onDone(freed);
 
   return (
     <Modal
@@ -65,15 +89,26 @@ export function ConfirmDeleteModal({
       onClose={busy ? () => {} : onClose}
       title={title}
       footer={
-        hasFailed ? (
+        attempt === "force" ? (
+          <Button variant="secondary" size="sm" onClick={finish}>
+            Done
+          </Button>
+        ) : hasFailed ? (
           <>
-            <Button variant="secondary" size="sm" disabled={busy} onClick={() => onDone(freed)}>
+            <Button variant="secondary" size="sm" disabled={busy} onClick={finish}>
               Done
             </Button>
-            <Button variant="danger" size="sm" disabled={busy} onClick={retryElevated}>
-              <ShieldAlert className="h-3.5 w-3.5" />
-              {busy ? "Requesting admin…" : `Retry ${failed.length} as administrator`}
-            </Button>
+            {attempt === "none" ? (
+              <Button variant="danger" size="sm" disabled={busy} onClick={retryElevated}>
+                <ShieldAlert className="h-3.5 w-3.5" />
+                {busy ? "Requesting admin…" : `Retry ${failed.length} as administrator`}
+              </Button>
+            ) : (
+              <Button variant="danger" size="sm" disabled={busy} onClick={retryForce}>
+                <Zap className="h-3.5 w-3.5" />
+                {busy ? "Closing programs…" : `Force Delete ${failed.length} item(s)`}
+              </Button>
+            )}
           </>
         ) : (
           <>
@@ -99,7 +134,7 @@ export function ConfirmDeleteModal({
         )
       }
     >
-      {!hasFailed && (
+      {attempt === "none" && !hasFailed && (
         <>
           <p className="mb-3 text-sm text-muted">
             {permanent
@@ -135,7 +170,7 @@ export function ConfirmDeleteModal({
         </>
       )}
 
-      {hasFailed && (
+      {attempt === "none" && hasFailed && (
         <>
           <div className="mb-3 flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2.5 text-sm text-warning">
             <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
@@ -153,6 +188,73 @@ export function ConfirmDeleteModal({
             ))}
           </div>
         </>
+      )}
+
+      {attempt === "elevated" && hasFailed && (
+        <>
+          <div className="mb-3 flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2.5 text-sm text-warning">
+            <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+            <span>
+              {failed.length} item(s) could not be removed even as administrator — something
+              else has them open. {freed > 0 && `Freed ${formatBytes(freed)} so far. `}
+              Force Delete closes whatever is using them and removes them; if that is still
+              not possible, they are scheduled to be removed automatically the next time you
+              restart your PC.
+            </span>
+          </div>
+          <div className="flex flex-col divide-y divide-border">
+            {failed.map((path) => (
+              <div key={path} className="truncate py-1.5 text-xs text-muted">
+                {path}
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {attempt === "force" && (
+        <div className="flex flex-col gap-3">
+          {freed > 0 && (
+            <p className="text-sm text-success">Freed {formatBytes(freed)} so far.</p>
+          )}
+          {scheduledForReboot.length > 0 && (
+            <div className="flex items-start gap-2 rounded-md border border-primary/30 bg-primary/10 px-3 py-2.5 text-sm">
+              <Clock className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
+              <div className="min-w-0 flex-1">
+                <p>
+                  {scheduledForReboot.length} item(s) are still open in something that could not
+                  be closed — Windows will remove them automatically the next time you restart
+                  your PC.
+                </p>
+                <div className="mt-2 flex flex-col divide-y divide-border">
+                  {scheduledForReboot.map((path) => (
+                    <div key={path} className="truncate py-1 text-xs text-muted">
+                      {path}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+          {failed.length > 0 && (
+            <div className="flex items-start gap-2 rounded-md border border-danger/40 bg-danger/10 px-3 py-2.5 text-sm text-danger">
+              <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+              <div className="min-w-0 flex-1">
+                <p>{failed.length} item(s) genuinely could not be removed at all.</p>
+                <div className="mt-2 flex flex-col divide-y divide-border">
+                  {failed.map((path) => (
+                    <div key={path} className="truncate py-1 text-xs">
+                      {path}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          )}
+          {scheduledForReboot.length === 0 && failed.length === 0 && (
+            <p className="text-sm text-success">Everything was removed.</p>
+          )}
+        </div>
       )}
 
       {error && <p className="mt-3 text-xs text-danger">{error}</p>}

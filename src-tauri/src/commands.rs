@@ -16,6 +16,8 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use sysinfo::Disks;
 use tauri::{AppHandle, Emitter, Manager, State};
+use winreg::enums::HKEY_LOCAL_MACHINE;
+use winreg::RegKey;
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -796,6 +798,43 @@ pub async fn launch_uninstaller(uninstall_string: String) -> Result<(), String> 
         .map_err(|e| e.to_string())?
 }
 
+/// Force-removes an application the normal uninstaller could not — closing
+/// related processes and removing the program, its registry entry and
+/// shortcuts directly. The last resort for when an app's own uninstaller is
+/// missing, broken, or (Microsoft Edge being the standard example) refuses
+/// to run at all, the same job a third-party tool like Revo Uninstaller does
+/// in its "forced" mode.
+///
+/// Runs without administrator rights first, which is enough on its own for
+/// most per-user installs; whatever still needs elevation (Program Files,
+/// the HKLM registry, all-users shortcuts) is reported so the caller can
+/// offer `force_uninstall_elevated`.
+#[tauri::command(async)]
+pub fn force_uninstall(target: uninstall::InstalledApp) -> uninstall::ForceUninstallReport {
+    uninstall::force_uninstall(&target)
+}
+
+/// Finishes whatever `force_uninstall` could not without administrator
+/// rights, in a single elevated pass (one UAC prompt). The elevated script's
+/// own exit code is not trusted — everything is re-checked afterward, so the
+/// report reflects what is actually gone rather than what the script claimed.
+#[tauri::command]
+pub async fn force_uninstall_elevated(
+    target: uninstall::InstalledApp,
+) -> Result<uninstall::ForceUninstallReport, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (script, attempted_edge) = uninstall::build_force_uninstall_script(&target);
+        run_elevated_powershell(&script, "storage_doctor_force_uninstall.ps1")?;
+        // Edge's own uninstaller keeps tearing down scheduled tasks briefly
+        // after setup.exe returns; give it a moment before checking whether
+        // it is really gone.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        Ok(uninstall::verify_force_uninstall(&target, attempted_edge))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// PNG data URIs for the given files, keyed by path. Images and videos get a
 /// real content thumbnail; everything else gets its file-type icon. Paths that
 /// cannot be rendered are simply absent from the map, so the UI falls back to
@@ -1199,6 +1238,32 @@ fn build_delete_script(paths: &[String], permanent: bool) -> String {
     script
 }
 
+/// Runs a PowerShell script with administrator rights and waits for it to
+/// finish — one UAC prompt. Shared by every operation that needs elevation
+/// (deleting, force-uninstalling, force-deleting): the script is written to a
+/// temp file first so its content never has to survive command-line quoting,
+/// then an outer non-elevated PowerShell launches an elevated one to run it.
+fn run_elevated_powershell(script: &str, temp_name: &str) -> Result<(), String> {
+    let tmp = std::env::temp_dir().join(temp_name);
+    std::fs::write(&tmp, script).map_err(|e| e.to_string())?;
+
+    let inner = format!(
+        "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden \
+         -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'",
+        tmp.display()
+    );
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &inner])
+        .status()
+        .map_err(|e| e.to_string())?;
+    let _ = std::fs::remove_file(&tmp);
+
+    if !status.success() {
+        return Err("Administrator permission was denied.".into());
+    }
+    Ok(())
+}
+
 /// Retries deletion with administrator rights, still sending items to the
 /// Recycle Bin (via the Windows shell). Triggers a single UAC prompt.
 #[tauri::command]
@@ -1216,27 +1281,8 @@ pub async fn delete_paths_elevated(
             .map(|p| (p.clone(), measure_path(Path::new(p))))
             .collect();
 
-        // Write the delete script to a temp file to avoid command-line quoting.
         let script = build_delete_script(&paths, permanent);
-        let tmp = std::env::temp_dir().join("storage_doctor_recycle.ps1");
-        std::fs::write(&tmp, script).map_err(|e| e.to_string())?;
-
-        // Outer (non-elevated) PowerShell launches an elevated PowerShell that
-        // runs the script, and waits for it to finish.
-        let inner = format!(
-            "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden \
-             -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'",
-            tmp.display()
-        );
-        let status = std::process::Command::new("powershell")
-            .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &inner])
-            .status()
-            .map_err(|e| e.to_string())?;
-        let _ = std::fs::remove_file(&tmp);
-
-        if !status.success() {
-            return Err("Administrator permission was denied.".into());
-        }
+        run_elevated_powershell(&script, "storage_doctor_recycle.ps1")?;
 
         let mut removals: Vec<Removal> = Vec::new();
         let mut failed = Vec::new();
@@ -1273,6 +1319,277 @@ pub async fn delete_paths_elevated(
         );
         Ok(DeleteResult {
             freed_bytes: freed,
+            failed,
+        })
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+// ---------------------------------------------------------------------------
+// Force delete — for the "this file is open in another program" case, once
+// an elevated retry has already failed. Identifies whatever holds the item
+// open via a Restart Manager session (the same mechanism Windows Update and
+// MSI installers use before replacing a file — there is no other supported
+// way to ask this question) and closes it; anything still locked afterward
+// is scheduled to be removed the moment Windows next starts, which always
+// succeeds because nothing can hold a lock across a restart before Windows
+// itself processes the request.
+//
+// This whole mechanism was built and verified against a real locked file on
+// a real machine before being wired in here — including the two sharp edges
+// that would otherwise have shipped silently broken: `Marshal
+// .GetLastWin32Error()` must be read in the same P/Invoke call as the API it
+// reports on (a separate PowerShell statement in between clobbers it), and
+// `PendingFileRenameOperations` already holds legitimate Windows Update and
+// Office entries on a real machine — the script only ever appends to it via
+// `MoveFileEx` itself, never rewrites the value directly.
+// ---------------------------------------------------------------------------
+
+/// C#, compiled once per script via `Add-Type`, giving the elevated
+/// PowerShell process the two Win32 building blocks force-delete needs:
+/// asking Restart Manager what has a path open, and scheduling a path for
+/// removal on next boot.
+const FORCE_DELETE_HELPER: &str = r#"
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+
+public class SDForceDelete {
+    [StructLayout(LayoutKind.Sequential)]
+    struct RM_UNIQUE_PROCESS {
+        public int dwProcessId;
+        public System.Runtime.InteropServices.ComTypes.FILETIME ProcessStartTime;
+    }
+    const int CCH_RM_MAX_APP_NAME = 255;
+    const int CCH_RM_MAX_SVC_NAME = 63;
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct RM_PROCESS_INFO {
+        public RM_UNIQUE_PROCESS Process;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_APP_NAME + 1)]
+        public string strAppName;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = CCH_RM_MAX_SVC_NAME + 1)]
+        public string strServiceShortName;
+        public int ApplicationType;
+        public uint AppStatus;
+        public uint TSSessionId;
+        [MarshalAs(UnmanagedType.Bool)]
+        public bool bRestartable;
+    }
+
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    static extern int RmStartSession(out uint pSessionHandle, int dwSessionFlags, string strSessionKey);
+    [DllImport("rstrtmgr.dll")]
+    static extern int RmEndSession(uint pSessionHandle);
+    [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
+    static extern int RmRegisterResources(uint pSessionHandle, uint nFiles, string[] rgsFilenames,
+        uint nApplications, RM_UNIQUE_PROCESS[] rgApplications, uint nServices, string[] rgsServiceNames);
+    [DllImport("rstrtmgr.dll")]
+    static extern int RmGetList(uint dwSessionHandle, out uint pnProcInfoNeeded, ref uint pnProcInfo,
+        [In, Out] RM_PROCESS_INFO[] rgAffectedApps, ref uint lpdwRebootReasons);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+    static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, uint dwFlags);
+
+    /// Process IDs Windows reports as currently holding `path` open. Best
+    /// effort throughout: any failure just means an empty list, and the
+    /// caller moves straight on to deleting.
+    public static int[] FindLockerPids(string path) {
+        var pids = new List<int>();
+        uint handle;
+        string key = Guid.NewGuid().ToString("N").Substring(0, 32);
+        if (RmStartSession(out handle, 0, key) != 0) return pids.ToArray();
+        try {
+            var files = new string[] { path };
+            if (RmRegisterResources(handle, (uint)files.Length, files, 0, null, 0, null) != 0) {
+                return pids.ToArray();
+            }
+            uint needed = 0, have = 0, reasons = 0;
+            int rc = RmGetList(handle, out needed, ref have, null, ref reasons);
+            if ((rc != 0 && rc != 234 /* ERROR_MORE_DATA */) || needed == 0) return pids.ToArray();
+            var infos = new RM_PROCESS_INFO[needed];
+            have = needed;
+            if (RmGetList(handle, out needed, ref have, infos, ref reasons) != 0) return pids.ToArray();
+            for (int i = 0; i < have; i++) pids.Add(infos[i].Process.dwProcessId);
+        } finally {
+            RmEndSession(handle);
+        }
+        return pids.ToArray();
+    }
+
+    static void CollectDepthFirst(string dir, List<string> into, int cap) {
+        if (into.Count >= cap) return;
+        foreach (var sub in Directory.GetDirectories(dir)) {
+            CollectDepthFirst(sub, into, cap);
+            if (into.Count >= cap) return;
+            into.Add(sub);
+        }
+        foreach (var file in Directory.GetFiles(dir)) {
+            into.Add(file);
+            if (into.Count >= cap) return;
+        }
+    }
+
+    /// Schedules `path` — and, for a folder, everything inside it, deepest
+    /// first — to be removed the moment Windows starts up next. A folder
+    /// with more than a couple of thousand entries is skipped rather than
+    /// scheduled partially: PendingFileRenameOperations is a single registry
+    /// value shared with Windows Update and Office, and this app has no
+    /// business growing it without bound.
+    public static bool ScheduleForReboot(string path) {
+        const int cap = 2000;
+        if (Directory.Exists(path)) {
+            var entries = new List<string>();
+            try { CollectDepthFirst(path, entries, cap); } catch { return false; }
+            if (entries.Count >= cap) return false;
+            entries.Add(path);
+            foreach (var p in entries) MoveFileEx(p, null, 0x4);
+            return true;
+        }
+        if (File.Exists(path)) {
+            return MoveFileEx(path, null, 0x4);
+        }
+        return false;
+    }
+}
+"@
+"#;
+
+/// Builds the elevated script: for each path, find and stop whatever has it
+/// open, retry the normal delete, and if it is still there afterward,
+/// schedule it for removal on next boot.
+fn build_force_delete_script(paths: &[String], permanent: bool) -> String {
+    let mut script = String::from("Add-Type -AssemblyName Microsoft.VisualBasic\n");
+    script.push_str(FORCE_DELETE_HELPER);
+
+    for path in paths {
+        let esc = path.replace('\'', "''");
+        script.push_str(&format!(
+            "try {{ foreach ($procId in [SDForceDelete]::FindLockerPids('{esc}')) {{ \
+                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }} }} catch {{ }}\n"
+        ));
+        script.push_str("Start-Sleep -Milliseconds 400\n");
+        if permanent {
+            script.push_str(&format!(
+                "try {{ Remove-Item -LiteralPath '{esc}' -Recurse -Force -ErrorAction SilentlyContinue }} catch {{ }}\n"
+            ));
+        } else {
+            script.push_str(&recycle_item_script_commands(&esc));
+        }
+        script.push_str(&format!(
+            "if (Test-Path -LiteralPath '{esc}') {{ [SDForceDelete]::ScheduleForReboot('{esc}') | Out-Null }}\n"
+        ));
+    }
+    script
+}
+
+/// Same shape as `build_delete_script`'s per-item recycle-bin snippet,
+/// factored out because `build_force_delete_script` needs it between two
+/// other steps rather than as the whole body of the loop.
+fn recycle_item_script_commands(esc: &str) -> String {
+    format!(
+        "try {{ if (Test-Path -LiteralPath '{esc}' -PathType Container) {{ \
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('{esc}','OnlyErrorDialogs','SendToRecycleBin') \
+         }} elseif (Test-Path -LiteralPath '{esc}') {{ \
+            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('{esc}','OnlyErrorDialogs','SendToRecycleBin') \
+         }} }} catch {{ }}\n"
+    )
+}
+
+/// True if `path` (or, for a folder, its own entry — `ScheduleForReboot`
+/// always adds the root last) is registered to be removed the next time
+/// Windows starts. Reading this key needs no elevation, unlike writing it.
+fn has_pending_reboot_delete(path: &str) -> bool {
+    let Ok(key) =
+        RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"SYSTEM\CurrentControlSet\Control\Session Manager")
+    else {
+        return false;
+    };
+    let Ok(entries) = key.get_value::<Vec<String>, _>("PendingFileRenameOperations") else {
+        return false;
+    };
+    let needle = path.to_lowercase();
+    entries.iter().any(|e| e.to_lowercase().contains(&needle))
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ForceDeleteResult {
+    pub freed_bytes: u64,
+    /// Removed immediately, once whatever had them open was closed.
+    pub removed: Vec<String>,
+    /// Not free yet — scheduled to be removed automatically the next time
+    /// the PC restarts, because nothing running right now could be made to
+    /// let go of them (a protected system process, most often).
+    pub scheduled_for_reboot: Vec<String>,
+    /// Could not be removed and could not even be scheduled — genuinely
+    /// stuck (very rare: a protected system file, or a folder too large to
+    /// schedule item-by-item safely).
+    pub failed: Vec<String>,
+}
+
+/// Force-deletes paths that failed even an administrator-elevated delete —
+/// offered only once that has already been tried, since this exists
+/// specifically for the case elevation alone cannot fix: the item is open
+/// somewhere, not merely permission-denied. One UAC prompt.
+#[tauri::command]
+pub async fn force_delete_paths(
+    app: AppHandle,
+    paths: Vec<String>,
+    source: Option<String>,
+    permanent: Option<bool>,
+) -> Result<ForceDeleteResult, String> {
+    let label = source.unwrap_or_else(|| "Force delete".into());
+    let permanent = permanent.unwrap_or(false);
+    tauri::async_runtime::spawn_blocking(move || {
+        let before: Vec<(String, cleaner::Measure)> = paths
+            .iter()
+            .map(|p| (p.clone(), measure_path(Path::new(p))))
+            .collect();
+
+        let script = build_force_delete_script(&paths, permanent);
+        run_elevated_powershell(&script, "storage_doctor_force_delete.ps1")?;
+
+        let mut removals: Vec<Removal> = Vec::new();
+        let mut scheduled_for_reboot = Vec::new();
+        let mut failed = Vec::new();
+
+        for (path, prior) in before {
+            let p = Path::new(&path);
+            if !p.exists() {
+                let after = measure_path(p);
+                removals.push(Removal {
+                    path: path.clone(),
+                    bytes: prior.size_bytes.saturating_sub(after.size_bytes),
+                    files: prior.file_count.saturating_sub(after.file_count),
+                    recoverable: prior
+                        .recoverable_bytes
+                        .saturating_sub(after.recoverable_bytes),
+                    vanished: true,
+                });
+            } else if has_pending_reboot_delete(&path) {
+                scheduled_for_reboot.push(path);
+            } else {
+                failed.push(path);
+            }
+        }
+
+        let freed: u64 = removals.iter().map(|r| r.bytes).sum();
+        let removed: Vec<String> = removals.iter().map(|r| r.path.clone()).collect();
+        sync_scan_after_delete(&app, &removals);
+        log_operation(
+            &app,
+            &label,
+            removals.len(),
+            freed,
+            if permanent { "force-permanent" } else { "force-recycle" },
+        );
+
+        Ok(ForceDeleteResult {
+            freed_bytes: freed,
+            removed,
+            scheduled_for_reboot,
             failed,
         })
     })
@@ -1779,6 +2096,47 @@ pub fn delete_file(app: AppHandle, path: String) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn force_delete_script_stops_lockers_before_deleting_and_schedules_reboot_fallback() {
+        let script = build_force_delete_script(&[r"C:\stuck\file.txt".to_string()], false);
+        assert!(script.contains("FindLockerPids"));
+        assert!(script.contains("Stop-Process -Id $procId"));
+        assert!(script.contains("SendToRecycleBin"));
+        assert!(script.contains("ScheduleForReboot"));
+        // Recycle Bin path is used, not a permanent Remove-Item.
+        assert!(!script.contains(r"Remove-Item -LiteralPath 'C:\stuck\file.txt' -Recurse"));
+        // The kill step must run, and finish, before the delete attempt.
+        let kill_pos = script.find("FindLockerPids").unwrap();
+        let delete_pos = script.find("SendToRecycleBin").unwrap();
+        assert!(kill_pos < delete_pos, "processes must be stopped before deleting");
+    }
+
+    #[test]
+    fn force_delete_script_permanent_mode_skips_the_recycle_bin() {
+        let script = build_force_delete_script(&[r"C:\stuck\file.txt".to_string()], true);
+        assert!(script.contains(r"Remove-Item -LiteralPath 'C:\stuck\file.txt' -Recurse -Force"));
+        assert!(!script.contains("SendToRecycleBin"));
+    }
+
+    #[test]
+    fn force_delete_script_escapes_single_quotes_in_paths() {
+        // A literal `'` inside a PowerShell single-quoted string must be
+        // doubled, or the script fails to parse (or worse, terminates the
+        // string early against attacker-controlled-looking content).
+        let script = build_force_delete_script(&[r"C:\it's\stuck.txt".to_string()], false);
+        assert!(script.contains(r"it''s"));
+        assert!(!script.contains(r"'C:\it's\stuck.txt'"));
+    }
+
+    /// Read-only against the real machine — safe, no side effects. A path
+    /// this app has never touched must never be reported as scheduled.
+    #[test]
+    fn pending_reboot_delete_is_false_for_a_path_never_scheduled() {
+        assert!(!has_pending_reboot_delete(
+            r"C:\this\path\was\never\scheduled\by\storage\doctor\tests.txt"
+        ));
+    }
 
     #[test]
     fn ancestors_walk_up_to_the_drive_root() {

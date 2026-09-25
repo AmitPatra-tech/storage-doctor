@@ -6,6 +6,8 @@ import type {
   DupeGroup,
   DupeProgress,
   FolderMeasurement,
+  ForceDeleteResult,
+  ForceUninstallReport,
   InstalledApp,
   Leftover,
   License,
@@ -394,6 +396,42 @@ export const backend = {
     return invoke("launch_uninstaller", { uninstallString });
   },
 
+  /** Force-removes an app the normal uninstaller could not — closes related
+   *  processes, then removes the program, its registry entry and shortcuts
+   *  directly. Runs without administrator rights; whatever needs elevation
+   *  is reported via `complete: false` for `forceUninstallElevated`. */
+  async forceUninstall(app: InstalledApp): Promise<ForceUninstallReport> {
+    if (!isTauri) {
+      return {
+        steps: [
+          { label: "Closed running processes", ok: true },
+          { label: "Removed the program's files", ok: false },
+          { label: "Removed it from Installed Apps", ok: false },
+          { label: "Removed shortcuts", ok: true },
+        ],
+        complete: false,
+      };
+    }
+    return invoke<ForceUninstallReport>("force_uninstall", { target: app });
+  },
+
+  /** Finishes whatever `forceUninstall` could not without administrator
+   *  rights, in a single elevated pass (one UAC prompt). */
+  async forceUninstallElevated(app: InstalledApp): Promise<ForceUninstallReport> {
+    if (!isTauri) {
+      return {
+        steps: [
+          { label: "Closed running processes", ok: true },
+          { label: "Removed the program's files", ok: true },
+          { label: "Removed it from Installed Apps", ok: true },
+          { label: "Removed shortcuts", ok: true },
+        ],
+        complete: true,
+      };
+    }
+    return invoke<ForceUninstallReport>("force_uninstall_elevated", { target: app });
+  },
+
   async findAppLeftovers(app: InstalledApp): Promise<Leftover[]> {
     if (!isTauri) {
       return [
@@ -428,6 +466,22 @@ export const backend = {
   ): Promise<DeleteResult> {
     if (!isTauri) return { freedBytes: paths.length * 2 ** 20, failed: [] };
     return invoke<DeleteResult>("delete_paths_elevated", { paths, source, permanent });
+  },
+
+  /** Last resort for paths that failed even an administrator-elevated
+   *  delete — "this file is open in another program". Closes whatever has
+   *  each one open and retries; anything still locked afterward is
+   *  scheduled to be removed automatically next time the PC restarts. One
+   *  UAC prompt. */
+  async forceDeletePaths(
+    paths: string[],
+    source?: string,
+    permanent = false
+  ): Promise<ForceDeleteResult> {
+    if (!isTauri) {
+      return { freedBytes: paths.length * 2 ** 20, removed: paths, scheduledForReboot: [], failed: [] };
+    }
+    return invoke<ForceDeleteResult>("force_delete_paths", { paths, source, permanent });
   },
 
   async regenerateRecommendations(): Promise<void> {

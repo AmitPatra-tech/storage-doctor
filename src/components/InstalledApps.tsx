@@ -1,10 +1,19 @@
 import { Fragment, useMemo, useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { ExternalLink, Loader2, Search, Sparkles, Trash2 } from "lucide-react";
+import {
+  Check,
+  ExternalLink,
+  Loader2,
+  Search,
+  ShieldAlert,
+  Sparkles,
+  Trash2,
+  X,
+} from "lucide-react";
 import { backend } from "@/lib/backend";
 import { refreshAfterCleanup } from "@/lib/refresh";
 import { formatBytes } from "@/lib/utils";
-import type { AppUsage, InstalledApp, Leftover } from "@/lib/types";
+import type { AppUsage, ForceUninstallReport, InstalledApp, Leftover } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { ConfirmDeleteModal, type DeleteItem } from "@/components/ConfirmDeleteModal";
@@ -20,6 +29,9 @@ function UninstallPanel({ app, onClose }: { app: InstalledApp; onClose: () => vo
   const [deleting, setDeleting] = useState(false);
   const [freed, setFreed] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [forcing, setForcing] = useState(false);
+  const [forceReport, setForceReport] = useState<ForceUninstallReport | null>(null);
+  const [forceError, setForceError] = useState<string | null>(null);
 
   const launch = async () => {
     setError(null);
@@ -90,6 +102,25 @@ function UninstallPanel({ app, onClose }: { app: InstalledApp; onClose: () => vo
 
   const selectedBytes =
     leftovers?.filter((l) => selected.has(l.path)).reduce((s, l) => s + l.sizeBytes, 0) ?? 0;
+
+  const runForce = async (elevated: boolean) => {
+    setForcing(true);
+    setForceError(null);
+    try {
+      const report = elevated
+        ? await backend.forceUninstallElevated(app)
+        : await backend.forceUninstall(app);
+      setForceReport(report);
+      if (report.complete) {
+        queryClient.invalidateQueries({ queryKey: ["installedApps"] });
+        refreshAfterCleanup(queryClient);
+      }
+    } catch (e) {
+      setForceError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setForcing(false);
+    }
+  };
 
   return (
     <div className="border-t border-border bg-background/40 px-6 py-4">
@@ -187,6 +218,62 @@ function UninstallPanel({ app, onClose }: { app: InstalledApp; onClose: () => vo
         )}
 
         {error && <p className="ml-8 text-xs text-danger">{error}</p>}
+
+        <div className="flex items-center gap-3 border-t border-border pt-3">
+          <span className="flex h-5 w-5 items-center justify-center rounded-full bg-surface-hover text-xs">
+            3
+          </span>
+          <span className="flex-1">
+            Still installed? Force uninstall it — closes it if it is running, then removes
+            the program, its entry here and its shortcuts directly, even without its own
+            uninstaller.
+          </span>
+          <Button size="sm" variant="danger" disabled={forcing} onClick={() => runForce(false)}>
+            {forcing ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <ShieldAlert className="h-3.5 w-3.5" />
+            )}
+            {forcing ? "Working…" : "Force Uninstall"}
+          </Button>
+        </div>
+
+        {forceReport && (
+          <div className="ml-8 flex flex-col gap-1.5">
+            {forceReport.steps.map((step) => (
+              <div key={step.label} className="flex items-center gap-2 text-xs">
+                {step.ok ? (
+                  <Check className="h-3.5 w-3.5 shrink-0 text-success" />
+                ) : (
+                  <X className="h-3.5 w-3.5 shrink-0 text-danger" />
+                )}
+                <span className={step.ok ? "text-muted" : "text-foreground"}>{step.label}</span>
+              </div>
+            ))}
+            {forceReport.complete ? (
+              <p className="mt-1 text-xs text-success">
+                Removed. Files went to the Recycle Bin; its entry in Installed Apps cannot
+                be undone.
+              </p>
+            ) : (
+              <div className="mt-1 flex items-center gap-3">
+                <Button
+                  size="sm"
+                  variant="danger"
+                  disabled={forcing}
+                  onClick={() => runForce(true)}
+                >
+                  <ShieldAlert className="h-3.5 w-3.5" />
+                  {forcing ? "Requesting admin…" : "Finish with Administrator Rights"}
+                </Button>
+                <span className="text-xs text-muted">
+                  Some of it needs administrator rights to remove.
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+        {forceError && <p className="ml-8 text-xs text-danger">{forceError}</p>}
 
         <div>
           <button className="text-xs text-muted hover:text-foreground" onClick={onClose}>
@@ -353,7 +440,7 @@ export function InstalledApps() {
                           : "—"}
                       </td>
                       <td className="px-5 py-3 text-right">
-                        {app.uninstallString ? (
+                        {app.uninstallString || app.installLocation ? (
                           <Button
                             size="sm"
                             variant={isOpen ? "secondary" : "ghost"}
@@ -363,7 +450,7 @@ export function InstalledApps() {
                             }}
                           >
                             <Trash2 className="h-3.5 w-3.5 text-danger" />
-                            Uninstall
+                            {app.uninstallString ? "Uninstall" : "Force Remove"}
                           </Button>
                         ) : (
                           <span className="text-xs text-muted">—</span>
@@ -426,7 +513,7 @@ export function InstalledApps() {
                               </div>
                             </div>
                           )}
-                          {app.uninstallString && (
+                          {(app.uninstallString || app.installLocation) && (
                             <UninstallPanel app={app} onClose={() => setOpenApp(null)} />
                           )}
                         </td>
