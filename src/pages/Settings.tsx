@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Check, Download, Loader2, Moon, RefreshCw, Sun } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { useAppUpdate } from "@/hooks/useAppUpdate";
@@ -38,12 +38,35 @@ function SettingRow({
 
 export function Settings() {
   const [settings, setSettings] = useState<AppSettings>(loadSettings);
+  const queryClient = useQueryClient();
   const { data: drives } = useQuery({ queryKey: ["drives"], queryFn: backend.getDrives });
   const { isPro, license, activate, deactivate } = useLicense();
   const { status: updateStatus, check: checkUpdate, install: installUpdate } = useAppUpdate();
   const [licenseKey, setLicenseKey] = useState("");
   const [licenseBusy, setLicenseBusy] = useState(false);
   const [licenseError, setLicenseError] = useState<string | null>(null);
+
+  // The Explorer right-click "Force delete" entry lives in the registry, not
+  // in this app's own settings, so its state is read from there.
+  const { data: contextMenuOn } = useQuery({
+    queryKey: ["contextMenu"],
+    queryFn: backend.contextMenuEnabled,
+  });
+  const [contextMenuBusy, setContextMenuBusy] = useState(false);
+  const [contextMenuError, setContextMenuError] = useState<string | null>(null);
+
+  const toggleContextMenu = async (enabled: boolean) => {
+    setContextMenuBusy(true);
+    setContextMenuError(null);
+    try {
+      await backend.setContextMenuEnabled(enabled);
+      await queryClient.invalidateQueries({ queryKey: ["contextMenu"] });
+    } catch (e) {
+      setContextMenuError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setContextMenuBusy(false);
+    }
+  };
 
   const activateLicense = async () => {
     setLicenseBusy(true);
@@ -105,6 +128,30 @@ export function Settings() {
                     Light
                   </Button>
                 </div>
+              }
+            />
+            <div className="border-t border-border" />
+            <SettingRow
+              label="Right-click Force Delete"
+              description={
+                contextMenuError
+                  ? contextMenuError
+                  : "Add “Force delete with Storage Doctor” to Explorer’s right-click menu (under “Show more options” on Windows 11) for files that won’t delete."
+              }
+              control={
+                <Button
+                  size="sm"
+                  variant={contextMenuOn ? "default" : "secondary"}
+                  disabled={contextMenuBusy}
+                  onClick={() => toggleContextMenu(!contextMenuOn)}
+                >
+                  {contextMenuBusy ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : contextMenuOn ? (
+                    <Check className="h-3.5 w-3.5" />
+                  ) : null}
+                  {contextMenuOn ? "Added" : "Add to menu"}
+                </Button>
               }
             />
           </CardContent>

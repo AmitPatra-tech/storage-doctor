@@ -13,6 +13,7 @@ import { Settings } from "@/pages/Settings";
 import { LicenseProvider } from "@/components/LicenseProvider";
 import { RunningTasksProvider } from "@/components/RunningTasksProvider";
 import { UpdateBanner } from "@/components/UpdateBanner";
+import { LaunchDeleteHandler } from "@/components/LaunchDeleteHandler";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -43,6 +44,7 @@ export function App() {
             </Route>
           </Routes>
           <UpdateBanner />
+          <LaunchDeleteHandler />
         </HashRouter>
         </RunningTasksProvider>
       </LicenseProvider>

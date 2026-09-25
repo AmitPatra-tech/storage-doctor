@@ -4,6 +4,7 @@ use crate::cleaner;
 use crate::dupes;
 use crate::recommendations;
 use crate::scanner;
+use crate::shell;
 use crate::thumbs;
 use crate::uninstall;
 use crate::AppState;
@@ -2091,6 +2092,35 @@ pub fn delete_file(app: AppHandle, path: String) -> Result<(), String> {
         }],
     );
     Ok(())
+}
+
+/// Returns and clears the path passed via the Explorer right-click verb
+/// (`--force-delete "<path>"`) when the app was launched that way. The UI
+/// calls this once on startup; a normal launch returns `None`.
+#[tauri::command]
+pub fn take_launch_delete_path(state: State<AppState>) -> Option<String> {
+    state
+        .pending_force_delete
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+}
+
+/// Whether the "Force delete with Storage Doctor" entry is currently in
+/// Explorer's right-click menu for this user.
+#[tauri::command(async)]
+pub fn context_menu_enabled() -> bool {
+    shell::is_registered()
+}
+
+/// Adds or removes the Explorer right-click entry (per-user, no admin).
+#[tauri::command(async)]
+pub fn set_context_menu_enabled(enabled: bool) -> Result<(), String> {
+    if enabled {
+        shell::register()
+    } else {
+        shell::unregister()
+    }
 }
 
 #[cfg(test)]
