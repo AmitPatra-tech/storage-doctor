@@ -1244,7 +1244,7 @@ fn build_delete_script(paths: &[String], permanent: bool) -> String {
 /// (deleting, force-uninstalling, force-deleting): the script is written to a
 /// temp file first so its content never has to survive command-line quoting,
 /// then an outer non-elevated PowerShell launches an elevated one to run it.
-fn run_elevated_powershell(script: &str, temp_name: &str) -> Result<(), String> {
+pub(crate) fn run_elevated_powershell(script: &str, temp_name: &str) -> Result<(), String> {
     let tmp = std::env::temp_dir().join(temp_name);
     std::fs::write(&tmp, script).map_err(|e| e.to_string())?;
 
@@ -1460,7 +1460,7 @@ public class SDForceDelete {
 /// Builds the elevated script: for each path, find and stop whatever has it
 /// open, retry the normal delete, and if it is still there afterward,
 /// schedule it for removal on next boot.
-fn build_force_delete_script(paths: &[String], permanent: bool) -> String {
+pub(crate) fn build_force_delete_script(paths: &[String], permanent: bool) -> String {
     let mut script = String::from("Add-Type -AssemblyName Microsoft.VisualBasic\n");
     script.push_str(FORCE_DELETE_HELPER);
 
@@ -1501,7 +1501,7 @@ fn recycle_item_script_commands(esc: &str) -> String {
 /// True if `path` (or, for a folder, its own entry — `ScheduleForReboot`
 /// always adds the root last) is registered to be removed the next time
 /// Windows starts. Reading this key needs no elevation, unlike writing it.
-fn has_pending_reboot_delete(path: &str) -> bool {
+pub(crate) fn has_pending_reboot_delete(path: &str) -> bool {
     let Ok(key) =
         RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"SYSTEM\CurrentControlSet\Control\Session Manager")
     else {
@@ -2094,16 +2094,92 @@ pub fn delete_file(app: AppHandle, path: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Returns and clears the path passed via the Explorer right-click verb
-/// (`--force-delete "<path>"`) when the app was launched that way. The UI
-/// calls this once on startup; a normal launch returns `None`.
-#[tauri::command]
-pub fn take_launch_delete_path(state: State<AppState>) -> Option<String> {
-    state
-        .pending_force_delete
-        .lock()
-        .ok()
-        .and_then(|mut pending| pending.take())
+/// A native Windows message box with no owner window — used by the headless
+/// right-click force-delete path, which never starts the webview UI.
+fn message_box(text: &str, flags: u32) -> i32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::MessageBoxW;
+    let wide = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            wide(text).as_ptr(),
+            wide("Storage Doctor").as_ptr(),
+            flags,
+        )
+    }
+}
+
+/// The Explorer right-click "Force delete with Storage Doctor" verb, handled
+/// entirely with native dialogs — no webview, no dashboard, so it is instant.
+///
+/// Recycle first (enough, and fast, when nothing holds the item open); if it
+/// is locked, one elevated pass closes whatever has it open and retries, or
+/// schedules it for removal on the next restart. Every outcome is reported in
+/// a native box. This is what `main` runs instead of `run()` when launched
+/// with `--force-delete "<path>"`.
+pub fn force_delete_cli(path: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        IDYES, MB_ICONERROR, MB_ICONINFORMATION, MB_ICONWARNING, MB_SETFOREGROUND, MB_TOPMOST,
+        MB_YESNO,
+    };
+    let front = MB_SETFOREGROUND | MB_TOPMOST;
+
+    if !Path::new(path).exists() {
+        message_box(
+            &format!("This item no longer exists:\n{path}"),
+            front | MB_ICONINFORMATION,
+        );
+        return;
+    }
+
+    let confirm = message_box(
+        &format!(
+            "Force delete this item?\n\n{path}\n\nAny program currently using it will be \
+             closed, and it will be moved to the Recycle Bin where possible."
+        ),
+        front | MB_YESNO | MB_ICONWARNING,
+    );
+    if confirm != IDYES {
+        return;
+    }
+
+    // 1) Plain recycle — fast, and all that is needed when nothing holds it.
+    let _ = trash::delete(path);
+    if !Path::new(path).exists() {
+        message_box(
+            &format!("Deleted — moved to the Recycle Bin:\n{path}"),
+            front | MB_ICONINFORMATION,
+        );
+        return;
+    }
+
+    // 2) Still there → locked or permission-denied. One elevated pass closes
+    //    the locker and retries, falling back to removal on next restart.
+    let script = build_force_delete_script(&[path.to_string()], false);
+    if let Err(e) = run_elevated_powershell(&script, "storage_doctor_force_delete_cli.ps1") {
+        message_box(
+            &format!("Could not force delete:\n{path}\n\n{e}"),
+            front | MB_ICONERROR,
+        );
+        return;
+    }
+
+    if !Path::new(path).exists() {
+        message_box(&format!("Deleted:\n{path}"), front | MB_ICONINFORMATION);
+    } else if has_pending_reboot_delete(path) {
+        message_box(
+            &format!(
+                "This item is still in use and could not be closed.\nWindows will remove it \
+                 automatically the next time you restart your PC:\n{path}"
+            ),
+            front | MB_ICONINFORMATION,
+        );
+    } else {
+        message_box(
+            &format!("Could not delete — the item is still in use:\n{path}"),
+            front | MB_ICONERROR,
+        );
+    }
 }
 
 /// Whether the "Force delete with Storage Doctor" entry is currently in

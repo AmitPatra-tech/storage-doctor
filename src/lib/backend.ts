@@ -666,21 +666,8 @@ export const backend = {
   },
 
   // --- Explorer right-click "Force delete with Storage Doctor" -----------
-
-  /** The path passed by the Explorer right-click verb when the app was
-   *  launched that way, or null. Cleared once read, so call it once on
-   *  startup. */
-  async takeLaunchDeletePath(): Promise<string | null> {
-    if (!isTauri) return null;
-    return invoke<string | null>("take_launch_delete_path");
-  },
-
-  /** Fires when a right-click "Force delete" happens while the app is
-   *  already open — the running instance receives the path here. */
-  async onForceDeleteRequest(cb: (path: string) => void): Promise<Unsubscribe> {
-    if (!isTauri) return () => {};
-    return listenTauri<string>("force-delete-request", cb);
-  },
+  // The verb itself is handled headlessly by the exe (native dialogs, no UI);
+  // these just manage whether the entry is installed.
 
   /** Whether the right-click entry is currently installed for this user. */
   async contextMenuEnabled(): Promise<boolean> {

@@ -10,7 +10,6 @@
 //! would require shipping a packaged `IExplorerCommand` handler; the registry
 //! verb here is the standard, admin-free approach every comparable tool uses.
 
-use std::path::Path;
 use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
 use winreg::RegKey;
 
@@ -112,14 +111,6 @@ pub fn unregister() -> Result<(), String> {
         }
     }
     Ok(())
-}
-
-/// True if `path` is a plain file or directory that exists — the only thing
-/// worth force-deleting. Guards against a junk `%1` (a virtual shell item,
-/// a deleted path) launching the flow against nothing.
-pub fn is_deletable_target(path: &str) -> bool {
-    let p = Path::new(path);
-    p.is_file() || p.is_dir()
 }
 
 #[cfg(test)]

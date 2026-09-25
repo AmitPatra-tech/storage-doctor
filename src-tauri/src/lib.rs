@@ -11,37 +11,36 @@ mod thumbs;
 mod uninstall;
 
 use std::sync::Mutex;
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
 pub struct AppState {
     pub db: Mutex<rusqlite::Connection>,
-    /// A path passed on the command line via `--force-delete "<path>"` (the
-    /// Explorer right-click verb), waiting for the UI to pick it up on start.
-    /// Taken exactly once by `take_launch_delete_path`.
-    pub pending_force_delete: Mutex<Option<String>>,
 }
 
-/// A `--force-delete` target from an argv, kept only if it is a real file or
-/// folder — a junk `%1` from the shell should launch nothing.
-fn force_delete_arg(args: &[String]) -> Option<String> {
-    shell::force_delete_target(args).filter(|p| shell::is_deletable_target(p))
+/// The Explorer right-click "Force delete" verb launches this exe with
+/// `--force-delete "<path>"`. When that flag is present we handle the whole
+/// thing with native dialogs and exit — never starting the webview UI, so it
+/// is instant. Returns whether it handled the launch (and the app should not
+/// start normally).
+pub fn maybe_run_force_delete_cli() -> bool {
+    let args: Vec<String> = std::env::args().collect();
+    match shell::force_delete_target(&args) {
+        Some(path) => {
+            commands::force_delete_cli(&path);
+            true
+        }
+        None => false,
+    }
 }
 
 pub fn run() {
     let conn = db::open().expect("failed to open database");
-    let initial_force_delete = force_delete_arg(&std::env::args().collect::<Vec<_>>());
 
     tauri::Builder::default()
-        // Must be registered first: a second launch (e.g. another right-click
-        // "Force delete") forwards its arguments to this running instance
-        // instead of opening a duplicate window.
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            if let Some(path) = force_delete_arg(&argv) {
-                if let Ok(mut pending) = app.state::<AppState>().pending_force_delete.lock() {
-                    *pending = Some(path.clone());
-                }
-                let _ = app.emit("force-delete-request", path);
-            }
+        // Registered first: a normal second launch focuses the existing
+        // window instead of opening a duplicate. (The right-click force-delete
+        // verb never reaches here — it is handled headlessly in `main`.)
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
                 let _ = window.show();
@@ -53,7 +52,6 @@ pub fn run() {
         .plugin(tauri_plugin_process::init())
         .manage(AppState {
             db: Mutex::new(conn),
-            pending_force_delete: Mutex::new(initial_force_delete),
         })
         .invoke_handler(tauri::generate_handler![
             commands::get_drives,
@@ -89,7 +87,6 @@ pub fn run() {
             commands::open_external,
             commands::reveal_in_explorer,
             commands::delete_file,
-            commands::take_launch_delete_path,
             commands::context_menu_enabled,
             commands::set_context_menu_enabled,
         ])
