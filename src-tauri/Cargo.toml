@@ -1,6 +1,6 @@
 [package]
 name = "storage-doctor"
-version = "1.0.0"
+version = "1.1.0"
 description = "Understand why your storage is filling up and clean it safely."
 authors = ["HutZon"]
 edition = "2021"
