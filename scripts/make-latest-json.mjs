@@ -42,7 +42,12 @@ if (!existsSync(sigPath)) {
 
 const signature = readFileSync(sigPath, "utf8").trim();
 const tag = `v${version}`;
-const url = `https://github.com/${REPO}/releases/download/${tag}/${encodeURIComponent(setupName)}`;
+// GitHub silently replaces spaces with dots in release asset filenames on
+// upload — `Storage Doctor_...` is served back as `Storage.Doctor_...`. The
+// manifest URL has to match what GitHub actually stores it as, not what
+// `tauri build` named the local file, or every user's auto-update 404s.
+const githubAssetName = setupName.replace(/ /g, ".");
+const url = `https://github.com/${REPO}/releases/download/${tag}/${encodeURIComponent(githubAssetName)}`;
 
 const manifest = {
   version,
