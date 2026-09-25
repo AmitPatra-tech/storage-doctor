@@ -464,54 +464,107 @@ pub struct ForceUninstallReport {
     pub complete: bool,
 }
 
-/// Background processes to stop that a plain install-folder match would
-/// miss — updaters and helpers that run from a separate location.
-fn known_process_names(name: &str) -> &'static [&'static str] {
+/// A background helper worth stopping that a plain install-folder match would
+/// miss — an updater or sign-in helper running from a separate location.
+///
+/// A helper is only ever matched when it is *both* named `exe_name` *and*
+/// running from inside one of `roots`. Matching a bare process name with no
+/// path check is dangerous: `msedgewebview2.exe` is the shared WebView2
+/// Runtime that unrelated applications — including this one — depend on to
+/// render their UI, so killing every process with that name crashes whatever
+/// happens to be running (which is exactly how force-uninstalling Edge blanked
+/// this app's own window). It is deliberately absent from the list below;
+/// uninstalling the Edge browser does not require touching the WebView2
+/// Runtime.
+struct KnownHelper {
+    exe_name: &'static str,
+    roots: Vec<PathBuf>,
+}
+
+fn known_helpers(name: &str) -> Vec<KnownHelper> {
     let n = norm(name);
+    let under = |rel: &str| -> Vec<PathBuf> {
+        [
+            env_path("ProgramFiles(x86)"),
+            env_path("ProgramFiles"),
+            env_path("LOCALAPPDATA"),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|p| p.join(rel))
+        .collect()
+    };
+
     if n.contains("microsoftedge") {
-        &["msedge.exe", "msedgewebview2.exe", "identity_helper.exe", "MicrosoftEdgeUpdate.exe"]
+        let mut helpers = vec![
+            KnownHelper { exe_name: "msedge.exe", roots: under(r"Microsoft\Edge") },
+            KnownHelper { exe_name: "identity_helper.exe", roots: under(r"Microsoft\Edge") },
+        ];
+        // The Edge updater lives in its own folder, beside the app, not inside
+        // it.
+        helpers.push(KnownHelper {
+            exe_name: "MicrosoftEdgeUpdate.exe",
+            roots: under(r"Microsoft\EdgeUpdate"),
+        });
+        helpers
     } else if n.contains("googlechrome") {
-        &["chrome.exe", "GoogleUpdate.exe", "elevation_service.exe"]
+        vec![
+            KnownHelper { exe_name: "chrome.exe", roots: under(r"Google\Chrome") },
+            // Google's updater and elevation service are shared across all
+            // Google products, so only stop them when they are running from
+            // Chrome's own tree, never system-wide.
+            KnownHelper { exe_name: "GoogleUpdate.exe", roots: under(r"Google\Chrome") },
+            KnownHelper { exe_name: "elevation_service.exe", roots: under(r"Google\Chrome") },
+        ]
     } else if n.contains("mozillafirefox") {
-        &["firefox.exe"]
+        vec![KnownHelper { exe_name: "firefox.exe", roots: under("Mozilla Firefox") }]
     } else {
-        &[]
+        Vec::new()
     }
 }
 
-/// True if any process matching this app is currently running: launched from
-/// its install folder, or one of its known background helpers.
-fn any_related_process_running(app: &InstalledApp) -> bool {
-    let sys = System::new_all();
-    let install_dir = install_dir_of(app);
-    let known = known_process_names(&app.name);
-    sys.processes().values().any(|process| {
-        let name = process.name().to_string_lossy().to_string();
-        let under_install_dir = install_dir
-            .as_deref()
-            .zip(process.exe())
-            .map(|(dir, exe)| exe.starts_with(dir))
-            .unwrap_or(false);
-        under_install_dir || known.iter().any(|k| k.eq_ignore_ascii_case(&name))
+/// Whether a process belongs to this app: launched from its install folder, or
+/// a known helper running from one of that helper's own legitimate roots.
+/// Never matches on process name alone.
+fn process_belongs_to(
+    process: &sysinfo::Process,
+    install_dir: Option<&Path>,
+    helpers: &[KnownHelper],
+) -> bool {
+    let Some(exe) = process.exe() else {
+        return false;
+    };
+    if let Some(dir) = install_dir {
+        if exe.starts_with(dir) {
+            return true;
+        }
+    }
+    let name = process.name().to_string_lossy();
+    helpers.iter().any(|h| {
+        h.exe_name.eq_ignore_ascii_case(&name) && h.roots.iter().any(|root| exe.starts_with(root))
     })
 }
 
-/// Stops every process matching this app — works without administrator
+/// True if any process belonging to this app is currently running.
+fn any_related_process_running(app: &InstalledApp) -> bool {
+    let sys = System::new_all();
+    let install_dir = destructive_install_dir(app);
+    let helpers = known_helpers(&app.name);
+    sys.processes()
+        .values()
+        .any(|p| process_belongs_to(p, install_dir.as_deref(), &helpers))
+}
+
+/// Stops every process belonging to this app — works without administrator
 /// rights for processes the signed-in user owns, which covers ordinary
 /// desktop apps even when installed machine-wide. Best effort: callers
 /// re-check `any_related_process_running` rather than trusting this.
 fn stop_related_processes(app: &InstalledApp) {
     let sys = System::new_all();
-    let install_dir = install_dir_of(app);
-    let known = known_process_names(&app.name);
+    let install_dir = destructive_install_dir(app);
+    let helpers = known_helpers(&app.name);
     for process in sys.processes().values() {
-        let name = process.name().to_string_lossy().to_string();
-        let under_install_dir = install_dir
-            .as_deref()
-            .zip(process.exe())
-            .map(|(dir, exe)| exe.starts_with(dir))
-            .unwrap_or(false);
-        if under_install_dir || known.iter().any(|k| k.eq_ignore_ascii_case(&name)) {
+        if process_belongs_to(process, install_dir.as_deref(), &helpers) {
             process.kill();
         }
     }
@@ -525,10 +578,57 @@ fn install_dir_of(app: &InstalledApp) -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// A directory too broad to ever be safe to recursively delete or to kill
+/// every process beneath. Some real installers write a `InstallLocation` of
+/// `C:\Program Files`, `C:\`, or even a user-profile root; taking that at face
+/// value as "this app's folder" would send half the machine to the Recycle
+/// Bin and kill unrelated processes. A genuine per-app folder is several
+/// levels deep (`C:\Program Files\Vendor\App`), so anything this shallow is
+/// rejected.
+fn is_protected_location(dir: &Path) -> bool {
+    // A drive root ("C:\") or a bare "\\server\share" has no app-specific
+    // component at all.
+    let comps: Vec<_> = dir.components().collect();
+    // Prefix (C:) + RootDir counts as 2 components; a real install path adds
+    // at least a couple more.
+    if comps.len() <= 3 {
+        return true;
+    }
+
+    let protected = [
+        env_path("SystemRoot"),                          // C:\Windows
+        env_path("ProgramFiles"),                        // C:\Program Files
+        env_path("ProgramFiles(x86)"),                   // C:\Program Files (x86)
+        env_path("ProgramData"),                         // C:\ProgramData
+        env_path("PUBLIC"),                              // C:\Users\Public
+        env_path("USERPROFILE"),                         // C:\Users\<me>
+        env_path("LOCALAPPDATA"),                        // …\AppData\Local
+        env_path("APPDATA"),                             // …\AppData\Roaming
+        env_path("SystemDrive").map(|p| p.join("Users")),
+        env_path("SystemRoot").map(|p| p.join("System32")),
+    ];
+    let canon = |p: &Path| p.to_string_lossy().trim_end_matches('\\').to_lowercase();
+    let target = canon(dir);
+    protected
+        .into_iter()
+        .flatten()
+        .any(|p| canon(&p) == target)
+}
+
+/// The install directory only when it is specific enough to be a safe
+/// destructive target — otherwise `None`, so force-uninstall falls back to the
+/// conservative leftover/registry/shortcut removal and never nukes a shared
+/// root. Every process-kill and folder-delete path goes through this, not
+/// `install_dir_of`.
+fn destructive_install_dir(app: &InstalledApp) -> Option<PathBuf> {
+    install_dir_of(app).filter(|dir| !is_protected_location(dir))
+}
+
 /// Everything this app's continued presence can be checked against: its own
 /// install folder plus whatever `find_leftovers` would still find.
 fn remaining_paths(app: &InstalledApp) -> Vec<PathBuf> {
-    let mut paths: Vec<PathBuf> = install_dir_of(app).into_iter().filter(|p| p.exists()).collect();
+    let mut paths: Vec<PathBuf> =
+        destructive_install_dir(app).into_iter().filter(|p| p.exists()).collect();
     paths.extend(
         find_leftovers(&app.name, &app.publisher, app.install_location.as_deref())
             .into_iter()
@@ -727,7 +827,13 @@ pub fn verify_force_uninstall(app: &InstalledApp, attempted_edge: bool) -> Force
         ok: find_shortcuts(&app.name, &app.publisher).is_empty(),
     });
 
-    let complete = registry_gone && install_dir_of(app).map(|p| !p.exists()).unwrap_or(true);
+    // Completeness is gated only on directories we would actually remove. A
+    // protected/too-broad install location is never a delete target, so its
+    // continued existence must not make a genuine removal read as incomplete.
+    let install_dir_gone = destructive_install_dir(app)
+        .map(|p| !p.exists())
+        .unwrap_or(true);
+    let complete = registry_gone && install_dir_gone;
     ForceUninstallReport { steps, complete }
 }
 
@@ -794,14 +900,18 @@ fn recycle_item_script(path: &Path) -> String {
 pub fn build_force_uninstall_script(app: &InstalledApp) -> (String, bool) {
     let mut script = String::from("Add-Type -AssemblyName Microsoft.VisualBasic\n");
 
-    for name in known_process_names(&app.name) {
-        let base = name.trim_end_matches(".exe").replace('\'', "''");
-        script.push_str(&format!(
-            "Stop-Process -Name '{base}' -Force -ErrorAction SilentlyContinue\n"
-        ));
+    // Only ever stop a process by its full path, never by bare name — killing
+    // every `msedgewebview2.exe` would take down the shared WebView2 Runtime
+    // that unrelated apps (including this one) render with. Each install-dir
+    // and each known helper's own roots are matched as path prefixes.
+    let mut kill_roots: Vec<PathBuf> = destructive_install_dir(app).into_iter().collect();
+    for helper in known_helpers(&app.name) {
+        kill_roots.extend(helper.roots);
     }
-    if let Some(dir) = install_dir_of(app) {
-        let esc = dir.to_string_lossy().replace('\'', "''");
+    kill_roots.sort();
+    kill_roots.dedup();
+    for root in kill_roots {
+        let esc = root.to_string_lossy().replace('\'', "''");
         script.push_str(&format!(
             "Get-Process | Where-Object {{ $_.Path -like '{esc}\\*' }} | Stop-Process -Force -ErrorAction SilentlyContinue\n"
         ));
@@ -905,6 +1015,71 @@ mod tests {
         let (script, attempted_edge) = build_force_uninstall_script(&not_edge);
         assert!(!attempted_edge);
         assert!(!script.contains("--system-level"));
+    }
+
+    /// A broad `InstallLocation` — which some real installers write — must
+    /// never be treated as a deletable/killable app folder, or force-uninstall
+    /// would send that whole tree to the Recycle Bin. A genuine per-app folder
+    /// several levels deep must still be accepted.
+    #[test]
+    fn broad_install_locations_are_never_destructive_targets() {
+        for broad in [
+            r"C:\",
+            r"C:\Windows",
+            r"C:\Windows\System32",
+            r"C:\Program Files",
+            r"C:\Program Files (x86)",
+            r"C:\ProgramData",
+        ] {
+            assert!(
+                is_protected_location(Path::new(broad)),
+                "{broad} must be protected from recursive removal"
+            );
+        }
+        // A real app folder is deep enough to be a safe target.
+        assert!(!is_protected_location(Path::new(
+            r"C:\Program Files (x86)\Microsoft\Edge\Application"
+        )));
+        assert!(!is_protected_location(Path::new(r"C:\Program Files\Vendor\App")));
+
+        // The user profile itself is protected; a specific app folder under
+        // LocalAppData is not.
+        if let Some(local) = env_path("LOCALAPPDATA") {
+            assert!(is_protected_location(&local));
+            assert!(!is_protected_location(&local.join("SomeVendor\\SomeApp")));
+        }
+    }
+
+    /// Regression: force-uninstalling the Edge browser blanked this app's own
+    /// window because the shared WebView2 Runtime (msedgewebview2.exe) was a
+    /// kill target. It must never be one — the browser and the runtime are
+    /// separate products, and unrelated apps render with the runtime.
+    #[test]
+    fn edge_force_uninstall_never_kills_the_shared_webview_runtime() {
+        let edge = InstalledApp {
+            name: "Microsoft Edge".to_string(),
+            version: "153.0.4234.48".to_string(),
+            publisher: "Microsoft Corporation".to_string(),
+            install_location: Some(r"C:\Program Files (x86)\Microsoft\Edge\Application".to_string()),
+            estimated_bytes: 0,
+            uninstall_string: None,
+            display_icon: None,
+        };
+
+        // No helper may name the shared runtime at all.
+        assert!(
+            known_helpers(&edge.name)
+                .iter()
+                .all(|h| !h.exe_name.eq_ignore_ascii_case("msedgewebview2.exe")),
+            "the WebView2 Runtime must not be a kill target for Edge"
+        );
+
+        // And the elevated script must only ever stop processes by full path
+        // (Where-Object $_.Path -like), never by bare name (Stop-Process -Name).
+        let (script, _) = build_force_uninstall_script(&edge);
+        assert!(!script.contains("Stop-Process -Name"));
+        assert!(!script.to_lowercase().contains("edgewebview"));
+        assert!(script.contains("$_.Path -like"));
     }
 
     // Shapes taken verbatim from real registry UninstallString values.
