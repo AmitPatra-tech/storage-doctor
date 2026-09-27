@@ -1393,17 +1393,49 @@ public class SDForceDelete {
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, uint dwFlags);
 
-    /// Process IDs Windows reports as currently holding `path` open. Best
-    /// effort throughout: any failure just means an empty list, and the
-    /// caller moves straight on to deleting.
+    /// Files to hand Restart Manager for a target. Restart Manager only
+    /// reports a process as using the exact resource registered — asking about
+    /// a *folder* never finds a process holding a file *inside* it. So for a
+    /// directory we register every file within (bounded), which is what makes
+    /// "the file is open somewhere in this folder" actually resolve.
+    static string[] ResourcesFor(string path) {
+        const int cap = 5000;
+        var files = new List<string>();
+        try {
+            if (Directory.Exists(path)) {
+                // Only real files may be registered — RmRegisterResources
+                // rejects the whole call if a directory path is included, which
+                // is why registering the folder itself found nothing.
+                CollectFilesForRm(path, files, cap);
+            } else if (File.Exists(path)) {
+                files.Add(path);
+            }
+        } catch { }
+        return files.ToArray();
+    }
+
+    static void CollectFilesForRm(string dir, List<string> into, int cap) {
+        if (into.Count >= cap) return;
+        string[] files;
+        try { files = Directory.GetFiles(dir); } catch { return; }
+        foreach (var f in files) { into.Add(f); if (into.Count >= cap) return; }
+        string[] subs;
+        try { subs = Directory.GetDirectories(dir); } catch { return; }
+        foreach (var s in subs) { CollectFilesForRm(s, into, cap); if (into.Count >= cap) return; }
+    }
+
+    /// Process IDs Windows reports as holding `path` — or, for a folder, any
+    /// file inside it — open. Best effort throughout: any failure just means
+    /// an empty list, and the caller moves straight on to deleting.
     public static int[] FindLockerPids(string path) {
         var pids = new List<int>();
+        var resources = ResourcesFor(path);
+        if (resources.Length == 0) return pids.ToArray();
         uint handle;
         string key = Guid.NewGuid().ToString("N").Substring(0, 32);
         if (RmStartSession(out handle, 0, key) != 0) return pids.ToArray();
         try {
-            var files = new string[] { path };
-            if (RmRegisterResources(handle, (uint)files.Length, files, 0, null, 0, null) != 0) {
+            if (RmRegisterResources(handle, (uint)resources.Length, resources, 0, null, 0, null) != 0) {
                 return pids.ToArray();
             }
             uint needed = 0, have = 0, reasons = 0;
@@ -1412,7 +1444,12 @@ public class SDForceDelete {
             var infos = new RM_PROCESS_INFO[needed];
             have = needed;
             if (RmGetList(handle, out needed, ref have, infos, ref reasons) != 0) return pids.ToArray();
-            for (int i = 0; i < have; i++) pids.Add(infos[i].Process.dwProcessId);
+            int self = System.Diagnostics.Process.GetCurrentProcess().Id;
+            for (int i = 0; i < have; i++) {
+                int pid = infos[i].Process.dwProcessId;
+                // Never target PID 0/4 (System) or ourselves.
+                if (pid > 4 && pid != self) pids.Add(pid);
+            }
         } finally {
             RmEndSession(handle);
         }
@@ -1466,18 +1503,29 @@ pub(crate) fn build_force_delete_script(paths: &[String], permanent: bool) -> St
 
     for path in paths {
         let esc = path.replace('\'', "''");
+        // Close everything holding the target (or a file inside it) open.
         script.push_str(&format!(
             "try {{ foreach ($procId in [SDForceDelete]::FindLockerPids('{esc}')) {{ \
                 Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }} }} catch {{ }}\n"
         ));
-        script.push_str("Start-Sleep -Milliseconds 400\n");
-        if permanent {
-            script.push_str(&format!(
+        // Retry the delete: a killed process releases its file handles
+        // asynchronously, so the first attempt right after the kill often still
+        // sees the file locked. Give it a few tries before giving up.
+        let delete_attempt = if permanent {
+            format!(
                 "try {{ Remove-Item -LiteralPath '{esc}' -Recurse -Force -ErrorAction SilentlyContinue }} catch {{ }}\n"
-            ));
+            )
         } else {
-            script.push_str(&recycle_item_script_commands(&esc));
-        }
+            recycle_item_script_commands(&esc)
+        };
+        script.push_str(&format!(
+            "for ($i = 0; $i -lt 6; $i++) {{\n\
+                Start-Sleep -Milliseconds 350\n\
+                {delete_attempt}\
+                if (-not (Test-Path -LiteralPath '{esc}')) {{ break }}\n\
+             }}\n"
+        ));
+        // Last resort only if it is still there: remove it on next full restart.
         script.push_str(&format!(
             "if (Test-Path -LiteralPath '{esc}') {{ [SDForceDelete]::ScheduleForReboot('{esc}') | Out-Null }}\n"
         ));
@@ -2169,8 +2217,9 @@ pub fn force_delete_cli(path: &str) {
     } else if has_pending_reboot_delete(path) {
         message_box(
             &format!(
-                "This item is still in use and could not be closed.\nWindows will remove it \
-                 automatically the next time you restart your PC:\n{path}"
+                "This item is held open by a process that can't be closed, so it has been \
+                 scheduled for removal.\n\nUse Start ▸ Power ▸ Restart to complete it — a full \
+                 restart, not Shut down (Windows Fast Startup skips this step on shutdown):\n{path}"
             ),
             front | MB_ICONINFORMATION,
         );
@@ -2203,6 +2252,19 @@ pub fn set_context_menu_enabled(enabled: bool) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Diagnostic: writes the exact script the app runs for the path in
+    /// SD_FDTEST_PATH to SD_FDTEST_OUT, so it can be run by hand against a
+    /// genuinely locked file.
+    ///   SD_FDTEST_PATH=... SD_FDTEST_OUT=... cargo test --lib \
+    ///     commands::tests::dump_force_delete_script -- --ignored
+    #[test]
+    #[ignore]
+    fn dump_force_delete_script() {
+        let path = std::env::var("SD_FDTEST_PATH").expect("SD_FDTEST_PATH");
+        let out = std::env::var("SD_FDTEST_OUT").expect("SD_FDTEST_OUT");
+        std::fs::write(&out, build_force_delete_script(&[path], false)).unwrap();
+    }
+
     #[test]
     fn force_delete_script_stops_lockers_before_deleting_and_schedules_reboot_fallback() {
         let script = build_force_delete_script(&[r"C:\stuck\file.txt".to_string()], false);
@@ -2223,6 +2285,19 @@ mod tests {
         let script = build_force_delete_script(&[r"C:\stuck\file.txt".to_string()], true);
         assert!(script.contains(r"Remove-Item -LiteralPath 'C:\stuck\file.txt' -Recurse -Force"));
         assert!(!script.contains("SendToRecycleBin"));
+    }
+
+    #[test]
+    fn force_delete_script_retries_the_delete_and_is_folder_aware() {
+        let script = build_force_delete_script(&[r"C:\stuck".to_string()], false);
+        // The delete is retried in a loop, not attempted once — a killed
+        // process releases its handles asynchronously.
+        assert!(script.contains("for ($i = 0; $i -lt 6; $i++)"));
+        assert!(script.contains("break"));
+        // Locker discovery collects the files inside a folder (so a process
+        // holding a file *within* the target is found), not just the target.
+        assert!(script.contains("CollectFilesForRm"));
+        assert!(script.contains("ResourcesFor"));
     }
 
     #[test]
