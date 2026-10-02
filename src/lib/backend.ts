@@ -479,7 +479,7 @@ export const backend = {
     permanent = false
   ): Promise<ForceDeleteResult> {
     if (!isTauri) {
-      return { freedBytes: paths.length * 2 ** 20, removed: paths, scheduledForReboot: [], failed: [] };
+      return { freedBytes: paths.length * 2 ** 20, removed: paths, scheduledForReboot: [], failed: [], blockedBy: [] };
     }
     return invoke<ForceDeleteResult>("force_delete_paths", { paths, source, permanent });
   },

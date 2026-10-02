@@ -46,7 +46,7 @@ export function ConfirmDeleteModal({
   onDone: (freedBytes: number) => void;
   onClose: () => void;
 }) {
-  const { busy, failed, scheduledForReboot, freed, error, run, forceDelete, reset } =
+  const { busy, failed, scheduledForReboot, blockedBy, freed, error, run, forceDelete, reset } =
     useSmartDelete();
   const [attempt, setAttempt] = useState<Attempt>("none");
 
@@ -217,14 +217,36 @@ export function ConfirmDeleteModal({
           {freed > 0 && (
             <p className="text-sm text-success">Freed {formatBytes(freed)} so far.</p>
           )}
-          {scheduledForReboot.length > 0 && (
+          {/* What's actually holding the item open — the honest, actionable
+              result. When present, a restart will not help. */}
+          {blockedBy.length > 0 && (
+            <div className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2.5 text-sm text-warning">
+              <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+              <div className="min-w-0 flex-1">
+                <p>
+                  Still in use — these couldn't be closed, so the item can't be removed yet:
+                </p>
+                <ul className="mt-1 list-disc pl-5 text-foreground">
+                  {blockedBy.map((name) => (
+                    <li key={name}>{name}</li>
+                  ))}
+                </ul>
+                <p className="mt-2 text-xs text-muted">
+                  Close (or quit) the program above, then try again. A restart won't remove it
+                  while that keeps it open — for a virtual machine disk, quit the app that owns
+                  the VM first.
+                </p>
+              </div>
+            </div>
+          )}
+          {blockedBy.length === 0 && scheduledForReboot.length > 0 && (
             <div className="flex items-start gap-2 rounded-md border border-primary/30 bg-primary/10 px-3 py-2.5 text-sm">
               <Clock className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
               <div className="min-w-0 flex-1">
                 <p>
-                  {scheduledForReboot.length} item(s) are still open in something that could not
-                  be closed — Windows will remove them automatically the next time you restart
-                  your PC.
+                  {scheduledForReboot.length} item(s) couldn't be removed now. A removal on the
+                  next <span className="font-medium">full restart</span> was scheduled as a last
+                  resort — but this isn't guaranteed, so check afterward.
                 </p>
                 <div className="mt-2 flex flex-col divide-y divide-border">
                   {scheduledForReboot.map((path) => (
@@ -236,11 +258,11 @@ export function ConfirmDeleteModal({
               </div>
             </div>
           )}
-          {failed.length > 0 && (
+          {failed.length > 0 && blockedBy.length === 0 && (
             <div className="flex items-start gap-2 rounded-md border border-danger/40 bg-danger/10 px-3 py-2.5 text-sm text-danger">
               <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
               <div className="min-w-0 flex-1">
-                <p>{failed.length} item(s) genuinely could not be removed at all.</p>
+                <p>{failed.length} item(s) could not be removed — they are still in use.</p>
                 <div className="mt-2 flex flex-col divide-y divide-border">
                   {failed.map((path) => (
                     <div key={path} className="truncate py-1 text-xs">
@@ -251,7 +273,7 @@ export function ConfirmDeleteModal({
               </div>
             </div>
           )}
-          {scheduledForReboot.length === 0 && failed.length === 0 && (
+          {scheduledForReboot.length === 0 && failed.length === 0 && blockedBy.length === 0 && (
             <p className="text-sm text-success">Everything was removed.</p>
           )}
         </div>

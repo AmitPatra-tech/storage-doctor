@@ -103,12 +103,14 @@ export interface ForceDeleteResult {
   freedBytes: number;
   /** Removed immediately, once whatever had them open was closed. */
   removed: string[];
-  /** Not free yet — Windows will remove these automatically the next time
-   *  the PC restarts, because nothing running right now could be made to
-   *  let go of them. */
+  /** A restart removal was scheduled as a last resort. Unreliable — kept only
+   *  as a fallback, never promised. */
   scheduledForReboot: string[];
   /** Genuinely could not be handled at all. */
   failed: string[];
+  /** Programs still holding an item open — what the user must close. When
+   *  non-empty, a restart will not help. */
+  blockedBy: string[];
 }
 
 export interface ForceUninstallStep {

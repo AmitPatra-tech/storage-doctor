@@ -8,9 +8,12 @@ import { backend } from "@/lib/backend";
 export function useSmartDelete() {
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState<string[]>([]);
-  /** Not free yet — set only by `forceDelete`, for items Windows will
-   *  remove automatically the next time the PC restarts. */
+  /** Set only by `forceDelete`: a restart removal was scheduled as a last
+   *  resort (unreliable — never promised). */
   const [scheduledForReboot, setScheduledForReboot] = useState<string[]>([]);
+  /** Programs still holding an item open after every attempt — what the user
+   *  must close. When set, a restart will not help. */
+  const [blockedBy, setBlockedBy] = useState<string[]>([]);
   const [freed, setFreed] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
@@ -18,6 +21,7 @@ export function useSmartDelete() {
     setBusy(false);
     setFailed([]);
     setScheduledForReboot([]);
+    setBlockedBy([]);
     setFreed(0);
     setError(null);
   }, []);
@@ -55,10 +59,11 @@ export function useSmartDelete() {
         setFreed((f) => f + res.freedBytes);
         setFailed(res.failed);
         setScheduledForReboot(res.scheduledForReboot);
+        setBlockedBy(res.blockedBy);
         return res;
       } catch (e) {
         setError(String(e));
-        return { freedBytes: 0, removed: [], scheduledForReboot: [], failed: paths };
+        return { freedBytes: 0, removed: [], scheduledForReboot: [], failed: paths, blockedBy: [] };
       } finally {
         setBusy(false);
       }
@@ -66,5 +71,5 @@ export function useSmartDelete() {
     []
   );
 
-  return { busy, failed, scheduledForReboot, freed, error, run, forceDelete, reset };
+  return { busy, failed, scheduledForReboot, blockedBy, freed, error, run, forceDelete, reset };
 }

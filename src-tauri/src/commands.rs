@@ -1494,18 +1494,57 @@ public class SDForceDelete {
 "@
 "#;
 
+/// Where the elevated force-delete script records the names of whatever still
+/// holds a path open after every attempt — so the caller can tell the user
+/// what to close, instead of falsely promising a restart will remove it.
+pub(crate) fn force_delete_blockers_path() -> PathBuf {
+    std::env::temp_dir().join("storage_doctor_fd_blockers.txt")
+}
+
 /// Builds the elevated script: for each path, find and stop whatever has it
-/// open, retry the normal delete, and if it is still there afterward,
-/// schedule it for removal on next boot.
+/// open, retry the normal delete, and if it is still there afterward, record
+/// what is still holding it (and schedule a reboot removal as a fallback).
 pub(crate) fn build_force_delete_script(paths: &[String], permanent: bool) -> String {
     let mut script = String::from("Add-Type -AssemblyName Microsoft.VisualBasic\n");
     script.push_str(FORCE_DELETE_HELPER);
+    script.push_str("$sdBlockers = New-Object System.Collections.Generic.HashSet[string]\n");
 
     for path in paths {
         let esc = path.replace('\'', "''");
         script.push_str(&robust_remove_block(&esc, permanent));
+        // If it survived every attempt, record who still holds it open. A
+        // locker that is the System process (PID <= 4) is the kernel / a
+        // virtual machine / a driver — unkillable, and not something a restart
+        // will clear if it re-opens the file at boot.
+        script.push_str(&format!(
+            "if (Test-Path -LiteralPath '{esc}') {{ try {{ foreach ($procId in [SDForceDelete]::FindLockerPids('{esc}')) {{ \
+                $n = (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName; \
+                if ($procId -le 4 -or [string]::IsNullOrEmpty($n)) {{ $null = $sdBlockers.Add('Windows or a virtual machine (a system process that can''t be closed)') }} \
+                else {{ $null = $sdBlockers.Add($n) }} }} }} catch {{ }} }}\n"
+        ));
     }
+
+    // Write the collected blocker names for the caller; clear any stale file
+    // when nothing is blocking.
+    let bf = force_delete_blockers_path().to_string_lossy().replace('\'', "''");
+    script.push_str(&format!(
+        "try {{ if ($sdBlockers.Count -gt 0) {{ ($sdBlockers -join [Environment]::NewLine) | Set-Content -LiteralPath '{bf}' -Encoding UTF8 }} \
+         else {{ Remove-Item -LiteralPath '{bf}' -Force -ErrorAction SilentlyContinue }} }} catch {{ }}\n"
+    ));
     script
+}
+
+/// Reads and clears the blocker-names file the elevated script wrote.
+fn read_force_delete_blockers() -> Vec<String> {
+    let path = force_delete_blockers_path();
+    let names = std::fs::read_to_string(&path)
+        .unwrap_or_default()
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    let _ = std::fs::remove_file(&path);
+    names
 }
 
 /// The shared "remove one stubborn path" routine, used by both force-delete
@@ -1589,6 +1628,11 @@ pub struct ForceDeleteResult {
     /// stuck (very rare: a protected system file, or a folder too large to
     /// schedule item-by-item safely).
     pub failed: Vec<String>,
+    /// Names of programs still holding one of the paths open after every
+    /// attempt — what the user must close. Non-empty means a restart will not
+    /// help (the item is re-opened by something that survives it, e.g. a
+    /// running virtual machine or Windows itself).
+    pub blocked_by: Vec<String>,
 }
 
 /// Force-deletes paths that failed even an administrator-elevated delete —
@@ -1610,8 +1654,10 @@ pub async fn force_delete_paths(
             .map(|p| (p.clone(), measure_path(Path::new(p))))
             .collect();
 
+        let _ = std::fs::remove_file(force_delete_blockers_path());
         let script = build_force_delete_script(&paths, permanent);
         run_elevated_powershell(&script, "storage_doctor_force_delete.ps1")?;
+        let blocked_by = read_force_delete_blockers();
 
         let mut removals: Vec<Removal> = Vec::new();
         let mut scheduled_for_reboot = Vec::new();
@@ -1653,6 +1699,7 @@ pub async fn force_delete_paths(
             removed,
             scheduled_for_reboot,
             failed,
+            blocked_by,
         })
     })
     .await
@@ -2215,7 +2262,8 @@ pub fn force_delete_cli(path: &str) {
     }
 
     // 2) Still there → locked or permission-denied. One elevated pass closes
-    //    the locker and retries, falling back to removal on next restart.
+    //    the locker and retries, and records what still holds it if it can't.
+    let _ = std::fs::remove_file(force_delete_blockers_path());
     let script = build_force_delete_script(&[path.to_string()], false);
     if let Err(e) = run_elevated_powershell(&script, "storage_doctor_force_delete_cli.ps1") {
         message_box(
@@ -2225,14 +2273,35 @@ pub fn force_delete_cli(path: &str) {
         return;
     }
 
+    let blockers = read_force_delete_blockers();
     if !Path::new(path).exists() {
         message_box(&format!("Deleted:\n{path}"), front | MB_ICONINFORMATION);
+    } else if !blockers.is_empty() {
+        // Be honest: name what is holding it, rather than promising a restart
+        // that will not help if that program re-opens the file at startup.
+        let who = blockers.join("\n• ");
+        let is_disk_image = path.to_lowercase().ends_with(".vhdx")
+            || path.to_lowercase().ends_with(".vhd");
+        let hint = if is_disk_image {
+            "\n\nThis is a virtual disk in use by a running virtual machine — quit the app \
+             that owns it (so its VM shuts down) and try again."
+        } else {
+            "\n\nClose that program (or uninstall it) and try again."
+        };
+        message_box(
+            &format!(
+                "Could not delete — this item is still open in:\n• {who}{hint}\n\nA restart \
+                 will not remove it while that keeps it open:\n{path}"
+            ),
+            front | MB_ICONERROR,
+        );
     } else if has_pending_reboot_delete(path) {
         message_box(
             &format!(
-                "This item is held open by a process that can't be closed, so it has been \
-                 scheduled for removal.\n\nUse Start ▸ Power ▸ Restart to complete it — a full \
-                 restart, not Shut down (Windows Fast Startup skips this step on shutdown):\n{path}"
+                "This item is in use and has been scheduled for removal on the next restart.\n\n\
+                 Use Start ▸ Power ▸ Restart (a full restart, not Shut down — Windows Fast \
+                 Startup skips this step). If it is still there afterward, the program that \
+                 opens it must be closed first:\n{path}"
             ),
             front | MB_ICONINFORMATION,
         );
