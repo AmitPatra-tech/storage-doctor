@@ -1351,7 +1351,7 @@ pub async fn delete_paths_elevated(
 /// PowerShell process the two Win32 building blocks force-delete needs:
 /// asking Restart Manager what has a path open, and scheduling a path for
 /// removal on next boot.
-const FORCE_DELETE_HELPER: &str = r#"
+pub(crate) const FORCE_DELETE_HELPER: &str = r#"
 Add-Type -TypeDefinition @"
 using System;
 using System.Collections.Generic;
@@ -1503,34 +1503,47 @@ pub(crate) fn build_force_delete_script(paths: &[String], permanent: bool) -> St
 
     for path in paths {
         let esc = path.replace('\'', "''");
-        // Close everything holding the target (or a file inside it) open.
-        script.push_str(&format!(
-            "try {{ foreach ($procId in [SDForceDelete]::FindLockerPids('{esc}')) {{ \
-                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }} }} catch {{ }}\n"
-        ));
-        // Retry the delete: a killed process releases its file handles
-        // asynchronously, so the first attempt right after the kill often still
-        // sees the file locked. Give it a few tries before giving up.
-        let delete_attempt = if permanent {
-            format!(
-                "try {{ Remove-Item -LiteralPath '{esc}' -Recurse -Force -ErrorAction SilentlyContinue }} catch {{ }}\n"
-            )
-        } else {
-            recycle_item_script_commands(&esc)
-        };
-        script.push_str(&format!(
-            "for ($i = 0; $i -lt 6; $i++) {{\n\
-                Start-Sleep -Milliseconds 350\n\
-                {delete_attempt}\
-                if (-not (Test-Path -LiteralPath '{esc}')) {{ break }}\n\
-             }}\n"
-        ));
-        // Last resort only if it is still there: remove it on next full restart.
-        script.push_str(&format!(
-            "if (Test-Path -LiteralPath '{esc}') {{ [SDForceDelete]::ScheduleForReboot('{esc}') | Out-Null }}\n"
-        ));
+        script.push_str(&robust_remove_block(&esc, permanent));
     }
     script
+}
+
+/// The shared "remove one stubborn path" routine, used by both force-delete
+/// and force-uninstall so anything that won't delete — a locked file, a
+/// folder with an open file inside, an ACL-protected program folder — is
+/// handled the same thorough way. `esc` is a PowerShell-single-quote-escaped
+/// path; the caller must have emitted `FORCE_DELETE_HELPER` earlier so the
+/// `SDForceDelete` type exists.
+///
+/// Each cycle: close every process holding the path (or a file within it)
+/// open, then retry the delete — handles release asynchronously after a kill,
+/// and new lockers can appear after the first pass. On the second cycle it
+/// also takes ownership and grants Administrators full control, which is what
+/// lets it remove a stubborn program whose files are locked down by ACLs
+/// (common for preinstalled/system apps). Only if every attempt fails does it
+/// fall back to removal on the next full restart.
+pub(crate) fn robust_remove_block(esc: &str, permanent: bool) -> String {
+    let delete_attempt = if permanent {
+        format!(
+            "try {{ Remove-Item -LiteralPath '{esc}' -Recurse -Force -ErrorAction SilentlyContinue }} catch {{ }}\n"
+        )
+    } else {
+        recycle_item_script_commands(esc)
+    };
+    format!(
+        "for ($i = 0; $i -lt 10; $i++) {{\n\
+            try {{ foreach ($procId in [SDForceDelete]::FindLockerPids('{esc}')) {{ \
+                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }} }} catch {{ }}\n\
+            if ($i -eq 1) {{\n\
+                try {{ & takeown /f '{esc}' /r /d y *>$null }} catch {{ }}\n\
+                try {{ & icacls '{esc}' /grant '*S-1-5-32-544:F' /t /c *>$null }} catch {{ }}\n\
+            }}\n\
+            Start-Sleep -Milliseconds 300\n\
+            {delete_attempt}\
+            if (-not (Test-Path -LiteralPath '{esc}')) {{ break }}\n\
+         }}\n\
+         if (Test-Path -LiteralPath '{esc}') {{ [SDForceDelete]::ScheduleForReboot('{esc}') | Out-Null }}\n"
+    )
 }
 
 /// Same shape as `build_delete_script`'s per-item recycle-bin snippet,
@@ -2290,10 +2303,17 @@ mod tests {
     #[test]
     fn force_delete_script_retries_the_delete_and_is_folder_aware() {
         let script = build_force_delete_script(&[r"C:\stuck".to_string()], false);
-        // The delete is retried in a loop, not attempted once — a killed
-        // process releases its handles asynchronously.
-        assert!(script.contains("for ($i = 0; $i -lt 6; $i++)"));
+        // The delete is retried in a loop, re-killing lockers each cycle — a
+        // killed process releases handles asynchronously, and new lockers can
+        // appear after the first pass.
+        assert!(script.contains("for ($i = 0; $i -lt 10; $i++)"));
         assert!(script.contains("break"));
+        // The kill *call* runs inside the loop, not once before it. (The name
+        // also appears earlier in the C# helper definition, so match the call
+        // site specifically.)
+        let loop_pos = script.find("for ($i = 0; $i -lt 10").unwrap();
+        let call_pos = script.find("::FindLockerPids(").unwrap();
+        assert!(call_pos > loop_pos, "locker kill must be inside the retry loop");
         // Locker discovery collects the files inside a folder (so a process
         // holding a file *within* the target is found), not just the target.
         assert!(script.contains("CollectFilesForRm"));
