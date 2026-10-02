@@ -117,9 +117,50 @@ pub fn list_installed() -> Vec<InstalledApp> {
         }
     }
 
+    // Surface Microsoft Edge even when it has no registry uninstall entry —
+    // either Windows never gave it one, or a prior partial removal deleted it
+    // while Edge's files stayed on disk (missing from Control Panel, but still
+    // launchable). Without this it could never be force-uninstalled from the
+    // list. Only added when the real browser isn't already registered.
+    if !by_name.keys().any(|n| norm(n) == "microsoftedge") {
+        if let Some(edge) = synthetic_edge() {
+            by_name.insert(edge.name.clone(), edge);
+        }
+    }
+
     let mut apps: Vec<InstalledApp> = by_name.into_values().collect();
     apps.sort_by(|a, b| b.estimated_bytes.cmp(&a.estimated_bytes).then(a.name.cmp(&b.name)));
     apps
+}
+
+/// A synthetic installed-app entry for Microsoft Edge built from its files on
+/// disk, for when it has no registry uninstall entry. `uninstall_string` is
+/// None so the Applications list routes it straight to force-uninstall.
+fn synthetic_edge() -> Option<InstalledApp> {
+    let app_dir = edge_application_dirs().into_iter().next()?;
+    let setup = newest_edge_setup(&app_dir)?; // <app_dir>\<ver>\Installer\setup.exe
+    let version_dir = setup.parent()?.parent()?; // <app_dir>\<ver>
+    let version = version_dir.file_name()?.to_string_lossy().into_owned();
+
+    // Edge keeps a launcher stub at Application\msedge.exe; fall back to the
+    // versioned one for the icon.
+    let stub = app_dir.join("msedge.exe");
+    let icon = if stub.is_file() {
+        Some(stub)
+    } else {
+        let versioned = version_dir.join("msedge.exe");
+        versioned.is_file().then_some(versioned)
+    };
+
+    Some(InstalledApp {
+        name: "Microsoft Edge".to_string(),
+        version,
+        publisher: "Microsoft Corporation".to_string(),
+        install_location: Some(app_dir.to_string_lossy().into_owned()),
+        estimated_bytes: dir_size(&app_dir),
+        uninstall_string: None,
+        display_icon: icon.map(|p| p.to_string_lossy().into_owned()),
+    })
 }
 
 /// Launches the application's own uninstaller (shows a UAC prompt when the

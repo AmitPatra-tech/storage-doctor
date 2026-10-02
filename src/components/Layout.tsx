@@ -12,7 +12,9 @@ import {
   Settings,
   Sparkles,
 } from "lucide-react";
+import { useQuery } from "@tanstack/react-query";
 import { cn } from "@/lib/utils";
+import { backend } from "@/lib/backend";
 import { useLicense } from "@/components/LicenseProvider";
 import { useRunningTasks } from "@/components/RunningTasksProvider";
 
@@ -31,6 +33,7 @@ const navItems = [
 export function Layout() {
   const { isPro } = useLicense();
   const { scanning, dupeScanning, deepSearching } = useRunningTasks();
+  const { data: version } = useQuery({ queryKey: ["appVersion"], queryFn: backend.appVersion });
 
   // These keep running while you are on another page, so the sidebar says so —
   // otherwise leaving the tab looks indistinguishable from cancelling.
@@ -76,12 +79,13 @@ export function Layout() {
             </NavLink>
           ))}
         </nav>
-        <div className="px-5 py-4 text-[11px]">
+        <div className="flex items-center justify-between gap-2 px-5 py-4 text-[11px]">
           {isPro ? (
             <span className="font-medium text-primary">Pro</span>
           ) : (
             <span className="text-muted">Free version</span>
           )}
+          {version && <span className="text-muted">v{version}</span>}
         </div>
       </aside>
       <main className="flex-1 overflow-y-auto">

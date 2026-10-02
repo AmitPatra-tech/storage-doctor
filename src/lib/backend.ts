@@ -669,6 +669,14 @@ export const backend = {
   // The verb itself is handled headlessly by the exe (native dialogs, no UI);
   // these just manage whether the entry is installed.
 
+  /** The app version, read from the bundle (tauri.conf.json) — the single
+   *  source of truth, so it is never hardcoded in the UI. */
+  async appVersion(): Promise<string> {
+    if (!isTauri) return "dev";
+    const { getVersion } = await import("@tauri-apps/api/app");
+    return getVersion();
+  },
+
   /** Whether the right-click entry is currently installed for this user. */
   async contextMenuEnabled(): Promise<boolean> {
     if (!isTauri) return false;

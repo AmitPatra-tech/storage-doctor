@@ -40,6 +40,7 @@ export function Settings() {
   const [settings, setSettings] = useState<AppSettings>(loadSettings);
   const queryClient = useQueryClient();
   const { data: drives } = useQuery({ queryKey: ["drives"], queryFn: backend.getDrives });
+  const { data: appVersion } = useQuery({ queryKey: ["appVersion"], queryFn: backend.appVersion });
   const { isPro, license, activate, deactivate } = useLicense();
   const { status: updateStatus, check: checkUpdate, install: installUpdate } = useAppUpdate();
   const [licenseKey, setLicenseKey] = useState("");
@@ -259,8 +260,8 @@ export function Settings() {
           </CardHeader>
           <CardContent className="pt-0">
             <p className="text-sm text-muted">
-              Storage Doctor 1.0.0 — by HutZon. No file contents ever leave your
-              computer.
+              Storage Doctor {appVersion ? `${appVersion} ` : ""}— by HutZon. No file
+              contents ever leave your computer.
             </p>
             <div className="mt-3 flex items-center gap-3">
               {updateStatus.state === "available" ? (
