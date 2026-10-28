@@ -1,5 +1,6 @@
 import { useCallback, useState } from "react";
 import { backend } from "@/lib/backend";
+import type { ForceDeleteResult, ItemNote } from "@/lib/types";
 
 /** Deletion with graceful failure handling, an admin-elevated retry, and a
  *  force-delete last resort for items still locked open even as
@@ -8,20 +9,19 @@ import { backend } from "@/lib/backend";
 export function useSmartDelete() {
   const [busy, setBusy] = useState(false);
   const [failed, setFailed] = useState<string[]>([]);
-  /** Set only by `forceDelete`: a restart removal was scheduled as a last
-   *  resort (unreliable — never promised). */
-  const [scheduledForReboot, setScheduledForReboot] = useState<string[]>([]);
-  /** Programs still holding an item open after every attempt — what the user
-   *  must close. When set, a restart will not help. */
-  const [blockedBy, setBlockedBy] = useState<string[]>([]);
+  /** The full result of the last force delete — null until one has run
+   *  successfully, so an error is never mistaken for "nothing left". */
+  const [forceResult, setForceResult] = useState<ForceDeleteResult | null>(null);
+  /** Items this app will never delete, with the reason — not retried. */
+  const [refused, setRefused] = useState<ItemNote[]>([]);
   const [freed, setFreed] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   const reset = useCallback(() => {
     setBusy(false);
     setFailed([]);
-    setScheduledForReboot([]);
-    setBlockedBy([]);
+    setRefused([]);
+    setForceResult(null);
     setFreed(0);
     setError(null);
   }, []);
@@ -36,10 +36,14 @@ export function useSmartDelete() {
           : await backend.deletePaths(paths, source, permanent);
         setFreed((f) => f + res.freedBytes);
         setFailed(res.failed);
+        setRefused((prev) => [
+          ...prev,
+          ...res.refused.filter((r) => !prev.some((p) => p.path === r.path)),
+        ]);
         return res;
       } catch (e) {
         setError(String(e));
-        return { freedBytes: 0, failed: paths };
+        return { freedBytes: 0, failed: paths, refused: [] as ItemNote[] };
       } finally {
         setBusy(false);
       }
@@ -47,9 +51,9 @@ export function useSmartDelete() {
     []
   );
 
-  /** Offered only once `run(paths, true, ...)` has already left failures —
-   *  that is the signal an item is genuinely open somewhere, not merely
-   *  permission-denied, which elevation alone cannot fix. */
+  /** Offered only once `run(paths, true, ...)` has already left failures.
+   *  Returns null when the force delete itself could not run (e.g. the
+   *  administrator prompt was declined); `failed` is left unchanged then. */
   const forceDelete = useCallback(
     async (paths: string[], source?: string, permanent = false) => {
       setBusy(true);
@@ -57,13 +61,16 @@ export function useSmartDelete() {
       try {
         const res = await backend.forceDeletePaths(paths, source, permanent);
         setFreed((f) => f + res.freedBytes);
-        setFailed(res.failed);
-        setScheduledForReboot(res.scheduledForReboot);
-        setBlockedBy(res.blockedBy);
+        setForceResult(res);
+        setFailed([
+          ...res.blocked.map((b) => b.path),
+          ...res.scheduledForReboot,
+          ...res.failed.map((f) => f.path),
+        ]);
         return res;
       } catch (e) {
         setError(String(e));
-        return { freedBytes: 0, removed: [], scheduledForReboot: [], failed: paths, blockedBy: [] };
+        return null;
       } finally {
         setBusy(false);
       }
@@ -71,5 +78,5 @@ export function useSmartDelete() {
     []
   );
 
-  return { busy, failed, scheduledForReboot, blockedBy, freed, error, run, forceDelete, reset };
+  return { busy, failed, refused, forceResult, freed, error, run, forceDelete, reset };
 }

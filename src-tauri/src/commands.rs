@@ -911,9 +911,78 @@ pub async fn find_app_leftovers(
 #[serde(rename_all = "camelCase")]
 pub struct DeleteResult {
     pub freed_bytes: u64,
-    /// Paths that could not be deleted (typically permission denied or the
-    /// file is locked). These can be retried with `delete_paths_elevated`.
+    /// Paths Windows refused to delete. These can be retried with
+    /// `delete_paths_elevated`.
     pub failed: Vec<String>,
+    /// Paths this app will not delete at all (a drive, a core Windows or
+    /// user folder, or anything inside Windows), each with the reason. Not
+    /// retried: no retry would make deleting them safe.
+    pub refused: Vec<BlockedItem>,
+}
+
+/// Why this app refuses to delete `path`, if it does. Deleting a drive or a
+/// core folder would break the PC. `force` adds one more rule: force delete
+/// closes every program using files in the target, so it is also refused for
+/// anything inside Windows — except the Windows cleanup folders this app's
+/// own recommendations target (Temp, Logs, crash dumps, update downloads).
+pub(crate) fn delete_refusal(path: &str, force: bool) -> Option<String> {
+    let p = Path::new(path);
+    let canon = |p: &Path| p.to_string_lossy().trim_end_matches('\\').to_lowercase();
+    let target = canon(p);
+    if p.parent().is_none() || target.len() <= 2 {
+        return Some("This is an entire drive. Storage Doctor never deletes a whole drive.".into());
+    }
+    let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
+    let core = [
+        env("SystemRoot"),
+        env("ProgramFiles"),
+        env("ProgramFiles(x86)"),
+        env("ProgramW6432"),
+        env("ProgramData"),
+        env("PUBLIC"),
+        env("USERPROFILE"),
+        env("LOCALAPPDATA"),
+        env("APPDATA"),
+        env("SystemDrive").map(|d| PathBuf::from(format!("{}\\Users", d.to_string_lossy()))),
+    ];
+    if core.iter().flatten().any(|c| canon(c) == target) {
+        return Some(
+            "This is a core Windows or user folder. Deleting it would break Windows or your \
+             programs, so Storage Doctor never deletes it."
+                .into(),
+        );
+    }
+    if force {
+        if let Some(win) = env("SystemRoot") {
+            let win = canon(&win);
+            let cleanup = ["temp", "logs", "minidump", "livekernelreports", "softwaredistribution\\download"];
+            let in_cleanup = cleanup.iter().any(|c| {
+                let root = format!("{win}\\{c}");
+                target == root || target.starts_with(&format!("{root}\\"))
+            });
+            if target.starts_with(&format!("{win}\\")) && !in_cleanup {
+                return Some(
+                    "This is part of Windows. Force delete would close the Windows components \
+                     using it, so Storage Doctor never force deletes inside the Windows folder."
+                        .into(),
+                );
+            }
+        }
+    }
+    None
+}
+
+/// Splits `paths` into those that may be deleted and those that are refused.
+fn split_refused(paths: Vec<String>, force: bool) -> (Vec<String>, Vec<BlockedItem>) {
+    let mut allowed = Vec::new();
+    let mut refused = Vec::new();
+    for path in paths {
+        match delete_refusal(&path, force) {
+            Some(why) => refused.push(BlockedItem { path, reasons: vec![why] }),
+            None => allowed.push(path),
+        }
+    }
+    (allowed, refused)
 }
 
 /// What is on disk at `p` right now — size, file count and clearable bytes.
@@ -984,6 +1053,7 @@ pub async fn delete_paths(
     let label = source.unwrap_or_else(|| "Cleanup".into());
     let permanent = permanent.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
+        let (paths, refused) = split_refused(paths, false);
         let mut removals: Vec<Removal> = Vec::new();
         let mut failed = Vec::new();
         for path in &paths {
@@ -1006,23 +1076,27 @@ pub async fn delete_paths(
                 trash::delete(p).is_ok()
             };
 
+            // How much was removed is measured rather than assumed: folders
+            // like Temp and the Recycle Bin are recreated empty straight away,
+            // and a permanent delete that fails part-way has still removed
+            // part of the folder.
+            let after = measure_path(p);
+            let bytes = before.size_bytes.saturating_sub(after.size_bytes);
+            let files = before.file_count.saturating_sub(after.file_count);
+            if ok || bytes > 0 || files > 0 {
+                removals.push(Removal {
+                    path: path.clone(),
+                    bytes,
+                    files,
+                    recoverable: before
+                        .recoverable_bytes
+                        .saturating_sub(after.recoverable_bytes),
+                    vanished: !p.exists(),
+                });
+            }
             if !ok {
                 failed.push(path.clone());
-                continue;
             }
-            // How much was freed is measured rather than assumed: folders like
-            // Temp and the Recycle Bin are recreated empty straight away, so
-            // the "before" size alone would overstate it.
-            let after = measure_path(p);
-            removals.push(Removal {
-                path: path.clone(),
-                bytes: before.size_bytes.saturating_sub(after.size_bytes),
-                files: before.file_count.saturating_sub(after.file_count),
-                recoverable: before
-                    .recoverable_bytes
-                    .saturating_sub(after.recoverable_bytes),
-                vanished: !p.exists(),
-            });
         }
 
         let freed: u64 = removals.iter().map(|r| r.bytes).sum();
@@ -1037,6 +1111,7 @@ pub async fn delete_paths(
         DeleteResult {
             freed_bytes: freed,
             failed,
+            refused,
         }
     })
     .await
@@ -1245,16 +1320,24 @@ fn build_delete_script(paths: &[String], permanent: bool) -> String {
 /// temp file first so its content never has to survive command-line quoting,
 /// then an outer non-elevated PowerShell launches an elevated one to run it.
 pub(crate) fn run_elevated_powershell(script: &str, temp_name: &str) -> Result<(), String> {
-    let tmp = std::env::temp_dir().join(temp_name);
+    use std::os::windows::process::CommandExt;
+    // Unique per run: two force-deletes started together from Explorer must
+    // not overwrite each other's script.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("{}_{stamp}_{temp_name}", std::process::id()));
     std::fs::write(&tmp, script).map_err(|e| e.to_string())?;
 
     let inner = format!(
         "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden \
-         -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'",
-        tmp.display()
+         -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','\"{}\"'",
+        tmp.display().to_string().replace('\'', "''")
     );
     let status = std::process::Command::new("powershell")
         .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &inner])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
         .status()
         .map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&tmp);
@@ -1277,25 +1360,30 @@ pub async fn delete_paths_elevated(
     let label = source.unwrap_or_else(|| "Cleanup (admin)".into());
     let permanent = permanent.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
+        let (paths, refused) = split_refused(paths, false);
         let before: Vec<(String, cleaner::Measure)> = paths
             .iter()
             .map(|p| (p.clone(), measure_path(Path::new(p))))
             .collect();
 
-        let script = build_delete_script(&paths, permanent);
-        run_elevated_powershell(&script, "storage_doctor_recycle.ps1")?;
+        if !paths.is_empty() {
+            let script = build_delete_script(&paths, permanent);
+            run_elevated_powershell(&script, "storage_doctor_recycle.ps1")?;
+        }
 
         let mut removals: Vec<Removal> = Vec::new();
         let mut failed = Vec::new();
         for (path, before) in before {
             let p = Path::new(&path);
             let after = measure_path(p);
-            // Directories like Temp and the Recycle Bin are recreated instantly
-            // by Windows, so "still exists" is not the same as "not deleted" —
-            // compare what it holds now against what it held before.
+            // Whatever was removed is counted, even if some of it remains.
+            // Done means: gone; or, for a permanent cache cleanup (or the
+            // Recycle Bin), emptied — Windows recreates Temp and similar
+            // folders straight away. A user's own item sent to the Recycle
+            // Bin must be gone entirely.
             let bytes = before.size_bytes.saturating_sub(after.size_bytes);
             let removed_files = before.file_count.saturating_sub(after.file_count);
-            if !p.exists() || bytes > 0 || removed_files > 0 {
+            if bytes > 0 || removed_files > 0 || !p.exists() {
                 removals.push(Removal {
                     path: path.clone(),
                     bytes,
@@ -1305,7 +1393,9 @@ pub async fn delete_paths_elevated(
                         .saturating_sub(after.recoverable_bytes),
                     vanished: !p.exists(),
                 });
-            } else {
+            }
+            let emptied_ok = permanent || recycle_bin_drive(&path).is_some();
+            if p.exists() && (after.file_count > 0 || !emptied_ok) {
                 failed.push(path);
             }
         }
@@ -1321,6 +1411,7 @@ pub async fn delete_paths_elevated(
         Ok(DeleteResult {
             freed_bytes: freed,
             failed,
+            refused,
         })
     })
     .await
@@ -1393,6 +1484,33 @@ public class SDForceDelete {
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
     static extern bool MoveFileEx(string lpExistingFileName, string lpNewFileName, uint dwFlags);
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    struct SHFILEOPSTRUCT {
+        public IntPtr hwnd;
+        public uint wFunc;
+        public string pFrom;
+        public string pTo;
+        public ushort fFlags;
+        [MarshalAs(UnmanagedType.Bool)] public bool fAnyOperationsAborted;
+        public IntPtr hNameMappings;
+        public string lpszProgressTitle;
+    }
+    [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+    static extern int SHFileOperation(ref SHFILEOPSTRUCT lpFileOp);
+
+    /// Sends a file or folder to the Recycle Bin with no UI at all. The
+    /// VisualBasic API used before shows "File In Use" error dialogs from this
+    /// hidden elevated process on every retry. Returns 0 on success. Like
+    /// Explorer with confirmations off, an item too large for the Recycle Bin
+    /// (or on a drive without one) is deleted permanently.
+    public static int Recycle(string path) {
+        var op = new SHFILEOPSTRUCT();
+        op.wFunc = 3;                               // FO_DELETE
+        op.pFrom = path + "\0\0";
+        op.fFlags = (ushort)(0x40 | 0x10 | 0x400 | 0x4); // ALLOWUNDO|NOCONFIRMATION|NOERRORUI|SILENT
+        return SHFileOperation(ref op);
+    }
+
     /// Files to hand Restart Manager for a target. Restart Manager only
     /// reports a process as using the exact resource registered — asking about
     /// a *folder* never finds a process holding a file *inside* it. So for a
@@ -1424,36 +1542,121 @@ public class SDForceDelete {
         foreach (var s in subs) { CollectFilesForRm(s, into, cap); if (into.Count >= cap) return; }
     }
 
-    /// Process IDs Windows reports as holding `path` — or, for a folder, any
-    /// file inside it — open. Best effort throughout: any failure just means
-    /// an empty list, and the caller moves straight on to deleting.
-    public static int[] FindLockerPids(string path) {
-        var pids = new List<int>();
+    /// Processes that are never closed, whatever Restart Manager says: killing
+    /// any of these crashes Windows, takes down unrelated services, or hard-
+    /// stops a running virtual machine. They are reported to the user instead.
+    static readonly HashSet<string> NeverClose = new HashSet<string>(StringComparer.OrdinalIgnoreCase) {
+        "System", "Registry", "Idle", "Memory Compression", "smss", "csrss", "wininit",
+        "winlogon", "services", "lsass", "lsaiso", "svchost", "dwm", "fontdrvhost",
+        "sihost", "ctfmon", "audiodg", "conhost", "MsMpEng", "NisSrv", "SecurityHealthService",
+        "vmwp", "vmmem", "vmcompute", "vmms", "storage-doctor"
+    };
+
+    public class Locker {
+        public int Pid;
+        public string Exe;      // process name, e.g. "WINWORD"
+        public string App;      // Restart Manager's friendly name, e.g. "Microsoft Word"
+        public string Service;  // service short name when the holder is a service
+        public int Type;        // RM_APP_TYPE
+        public bool Closable;
+    }
+
+    /// Everything Windows reports as holding `path` — or, for a folder, any
+    /// file inside it — open. Includes the System process (PID 4) and
+    /// critical processes: those are never closed, but they must still be
+    /// reported, or the user is told nothing about why the delete failed.
+    public static Locker[] GetLockers(string path) {
+        var list = new List<Locker>();
         var resources = ResourcesFor(path);
-        if (resources.Length == 0) return pids.ToArray();
+        if (resources.Length == 0) return list.ToArray();
         uint handle;
         string key = Guid.NewGuid().ToString("N").Substring(0, 32);
-        if (RmStartSession(out handle, 0, key) != 0) return pids.ToArray();
+        if (RmStartSession(out handle, 0, key) != 0) return list.ToArray();
         try {
             if (RmRegisterResources(handle, (uint)resources.Length, resources, 0, null, 0, null) != 0) {
-                return pids.ToArray();
+                return list.ToArray();
             }
             uint needed = 0, have = 0, reasons = 0;
             int rc = RmGetList(handle, out needed, ref have, null, ref reasons);
-            if ((rc != 0 && rc != 234 /* ERROR_MORE_DATA */) || needed == 0) return pids.ToArray();
+            if ((rc != 0 && rc != 234 /* ERROR_MORE_DATA */) || needed == 0) return list.ToArray();
             var infos = new RM_PROCESS_INFO[needed];
             have = needed;
-            if (RmGetList(handle, out needed, ref have, infos, ref reasons) != 0) return pids.ToArray();
+            if (RmGetList(handle, out needed, ref have, infos, ref reasons) != 0) return list.ToArray();
             int self = System.Diagnostics.Process.GetCurrentProcess().Id;
             for (int i = 0; i < have; i++) {
                 int pid = infos[i].Process.dwProcessId;
-                // Never target PID 0/4 (System) or ourselves.
-                if (pid > 4 && pid != self) pids.Add(pid);
+                if (pid == self) continue;
+                string exe = "";
+                if (pid <= 4) {
+                    exe = "System";
+                } else {
+                    try { exe = System.Diagnostics.Process.GetProcessById(pid).ProcessName; } catch { }
+                    // Exited between the query and now: it no longer holds anything.
+                    if (exe.Length == 0) continue;
+                }
+                var l = new Locker();
+                l.Pid = pid;
+                l.Exe = exe;
+                l.App = infos[i].strAppName ?? "";
+                l.Service = infos[i].strServiceShortName ?? "";
+                l.Type = infos[i].ApplicationType;
+                l.Closable = pid > 4
+                    && l.Type != 1000 /* RmCritical */
+                    && l.Type != 3    /* RmService */
+                    && l.Service.Length == 0
+                    && !NeverClose.Contains(exe);
+                list.Add(l);
             }
         } finally {
             RmEndSession(handle);
         }
+        return list.ToArray();
+    }
+
+    /// Only the lockers it is safe to close.
+    public static int[] FindLockerPids(string path) {
+        var pids = new List<int>();
+        foreach (var l in GetLockers(path)) { if (l.Closable) pids.Add(l.Pid); }
         return pids.ToArray();
+    }
+
+    public static string DisplayName(Locker l) {
+        if (l.Pid <= 4) return "Windows (System process)";
+        string exe = l.Exe + ".exe";
+        if (l.App.Length > 0 && !l.App.Equals(l.Exe, StringComparison.OrdinalIgnoreCase)
+            && !l.App.Equals(exe, StringComparison.OrdinalIgnoreCase)) {
+            return l.App + " (" + exe + ")";
+        }
+        return exe;
+    }
+
+    /// One line telling the user exactly what holds the item and why this
+    /// app did not close it. `closedExes` = process names this run already
+    /// closed once (so a survivor of the same name started again).
+    public static string Describe(Locker l, HashSet<string> closedExes) {
+        string name = DisplayName(l);
+        if (l.Pid <= 4) {
+            return "Windows itself (the System process). This happens when a virtual machine " +
+                   "(Hyper-V, WSL, an app's built-in VM) or a driver is using the file. Quit the " +
+                   "app that owns the virtual machine, then try again.";
+        }
+        string lower = l.Exe.ToLowerInvariant();
+        if (lower == "vmwp" || lower == "vmmem" || lower == "vmcompute" || lower == "vmms") {
+            return name + ": a running virtual machine. Quit the app that owns the virtual machine, then try again.";
+        }
+        if (l.Service.Length > 0 || l.Type == 3) {
+            string svc = l.Service.Length > 0 ? l.Service : l.Exe;
+            return name + ": the Windows service \"" + svc + "\". Services are not stopped automatically; " +
+                   "stop it in the Services app, or uninstall the program it belongs to, then try again.";
+        }
+        if (l.Type == 1000 || NeverClose.Contains(l.Exe)) {
+            return name + ": a Windows system process that cannot be closed safely.";
+        }
+        if (closedExes != null && closedExes.Contains(l.Exe)) {
+            return name + ": it was closed, but started again and re-opened the file. " +
+                   "Quit it fully (check the system tray) or disable it from starting, then try again.";
+        }
+        return name + ": Windows refused to close it. Close it yourself, then try again.";
     }
 
     static void CollectDepthFirst(string dir, List<string> into, int cap) {
@@ -1475,20 +1678,23 @@ public class SDForceDelete {
     /// scheduled partially: PendingFileRenameOperations is a single registry
     /// value shared with Windows Update and Office, and this app has no
     /// business growing it without bound.
-    public static bool ScheduleForReboot(string path) {
+    /// 0 = scheduled; 1 = folder too large to schedule; 2 = Windows refused
+    /// (or the folder could not be listed); 3 = the path no longer exists.
+    public static int ScheduleForReboot(string path) {
         const int cap = 2000;
         if (Directory.Exists(path)) {
             var entries = new List<string>();
-            try { CollectDepthFirst(path, entries, cap); } catch { return false; }
-            if (entries.Count >= cap) return false;
-            entries.Add(path);
+            try { CollectDepthFirst(path, entries, cap); } catch { return 2; }
+            if (entries.Count >= cap) return 1;
             foreach (var p in entries) MoveFileEx(p, null, 0x4);
-            return true;
+            // The folder's own entry decides the outcome: it is what the
+            // caller later checks for, and it is added last.
+            return MoveFileEx(path, null, 0x4) ? 0 : 2;
         }
         if (File.Exists(path)) {
-            return MoveFileEx(path, null, 0x4);
+            return MoveFileEx(path, null, 0x4) ? 0 : 2;
         }
-        return false;
+        return 3;
     }
 }
 "@
@@ -1497,71 +1703,149 @@ public class SDForceDelete {
 /// Where the elevated force-delete script records the names of whatever still
 /// holds a path open after every attempt — so the caller can tell the user
 /// what to close, instead of falsely promising a restart will remove it.
-pub(crate) fn force_delete_blockers_path() -> PathBuf {
-    std::env::temp_dir().join("storage_doctor_fd_blockers.txt")
+/// A unique report file per force-delete run, so two right-click deletes
+/// started together can't read each other's results.
+fn new_force_report_path() -> PathBuf {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!(
+        "storage_doctor_fd_report_{}_{stamp}.txt",
+        std::process::id()
+    ))
 }
 
-/// Builds the elevated script: for each path, find and stop whatever has it
-/// open, retry the normal delete, and if it is still there afterward, record
-/// what is still holding it (and schedule a reboot removal as a fallback).
-pub(crate) fn build_force_delete_script(paths: &[String], permanent: bool) -> String {
+/// Builds the elevated force-delete script. For each path: close what holds
+/// it open (only processes that are safe to close) and retry the delete. If
+/// it still exists afterwards, it records exactly what holds it and does NOT
+/// schedule a restart deletion — whatever holds it (a VM, a service, an app
+/// that re-launches) would simply hold it again, and promising otherwise was
+/// a lie. A restart deletion is scheduled only when nothing holds it at all.
+///
+/// Every outcome is written as a tab-separated line to `report`:
+/// `closed\t<path>\t<program>`, `blocked\t<path>\t<explanation>`,
+/// `unschedulable\t<path>\t`, and a final `done` line proving the script ran
+/// to the end (it is absent if the UAC prompt was declined).
+pub(crate) fn build_force_delete_script(paths: &[String], permanent: bool, report: &Path) -> String {
     let mut script = String::from("Add-Type -AssemblyName Microsoft.VisualBasic\n");
     script.push_str(FORCE_DELETE_HELPER);
-    script.push_str("$sdBlockers = New-Object System.Collections.Generic.HashSet[string]\n");
+    script.push_str("$sdOut = New-Object 'System.Collections.Generic.List[string]'\n");
 
     for path in paths {
         let esc = path.replace('\'', "''");
-        script.push_str(&robust_remove_block(&esc, permanent));
-        // If it survived every attempt, record who still holds it open. A
-        // locker that is the System process (PID <= 4) is the kernel / a
-        // virtual machine / a driver — unkillable, and not something a restart
-        // will clear if it re-opens the file at boot.
+        script.push_str(&robust_remove_block(&esc, permanent, false));
         script.push_str(&format!(
-            "if (Test-Path -LiteralPath '{esc}') {{ try {{ foreach ($procId in [SDForceDelete]::FindLockerPids('{esc}')) {{ \
-                $n = (Get-Process -Id $procId -ErrorAction SilentlyContinue).ProcessName; \
-                if ($procId -le 4 -or [string]::IsNullOrEmpty($n)) {{ $null = $sdBlockers.Add('Windows or a virtual machine (a system process that can''t be closed)') }} \
-                else {{ $null = $sdBlockers.Add($n) }} }} }} catch {{ }} }}\n"
+            "if (Test-Path -LiteralPath '{esc}') {{\n\
+                $sdLeft = @(); try {{ $sdLeft = @([SDForceDelete]::GetLockers('{esc}')) }} catch {{ }}\n\
+                if ($sdLeft.Count -gt 0) {{\n\
+                    foreach ($l in $sdLeft) {{ $sdOut.Add(\"blocked`t\" + '{esc}' + \"`t\" + [SDForceDelete]::Describe($l, $sdClosedExes)) }}\n\
+                }} else {{\n\
+                    $sdR = [SDForceDelete]::ScheduleForReboot('{esc}')\n\
+                    if ($sdR -ne 0) {{ $sdOut.Add(\"unschedulable`t\" + '{esc}' + \"`t\" + $sdR) }}\n\
+                }}\n\
+             }}\n"
         ));
     }
 
-    // Write the collected blocker names for the caller; clear any stale file
-    // when nothing is blocking.
-    let bf = force_delete_blockers_path().to_string_lossy().replace('\'', "''");
+    let rf = report.to_string_lossy().replace('\'', "''");
     script.push_str(&format!(
-        "try {{ if ($sdBlockers.Count -gt 0) {{ ($sdBlockers -join [Environment]::NewLine) | Set-Content -LiteralPath '{bf}' -Encoding UTF8 }} \
-         else {{ Remove-Item -LiteralPath '{bf}' -Force -ErrorAction SilentlyContinue }} }} catch {{ }}\n"
+        "$sdOut.Add('done')\n\
+         try {{ [System.IO.File]::WriteAllLines('{rf}', $sdOut) }} catch {{ }}\n"
     ));
     script
 }
 
-/// Reads and clears the blocker-names file the elevated script wrote.
-fn read_force_delete_blockers() -> Vec<String> {
-    let path = force_delete_blockers_path();
-    let names = std::fs::read_to_string(&path)
-        .unwrap_or_default()
-        .lines()
-        .map(|l| l.trim().to_string())
-        .filter(|l| !l.is_empty())
-        .collect();
-    let _ = std::fs::remove_file(&path);
-    names
+/// What the elevated force-delete script reported, parsed from its file.
+#[derive(Default)]
+struct ForceReport {
+    /// The script ran to the end (false if UAC was declined or it crashed).
+    completed: bool,
+    /// (path, program closed for it)
+    closed: Vec<(String, String)>,
+    /// (path, explanation of what still holds it)
+    blocked: Vec<(String, String)>,
+    /// Paths nothing holds, but which could not even be scheduled, with the
+    /// `ScheduleForReboot` code (1 = too many entries, 2 = Windows refused).
+    unschedulable: Vec<(String, String)>,
+}
+
+impl ForceReport {
+    fn blocked_for(&self, path: &str) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .blocked
+            .iter()
+            .filter(|(p, _)| p == path)
+            .map(|(_, why)| why.clone())
+            .collect();
+        v.dedup();
+        v
+    }
+    fn closed_programs(&self) -> Vec<String> {
+        let mut v: Vec<String> = Vec::new();
+        for (_, name) in &self.closed {
+            if !v.contains(name) {
+                v.push(name.clone());
+            }
+        }
+        v
+    }
+}
+
+/// Reads and deletes the report file.
+fn read_force_report(report: &Path) -> ForceReport {
+    let text = std::fs::read_to_string(report).unwrap_or_default();
+    let _ = std::fs::remove_file(report);
+    let mut r = ForceReport::default();
+    for line in text.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let kind = parts.next().unwrap_or("").trim_start_matches('\u{feff}');
+        let path = parts.next().unwrap_or("").to_string();
+        let detail = parts.next().unwrap_or("").to_string();
+        match kind {
+            "done" => r.completed = true,
+            "closed" => r.closed.push((path, detail)),
+            "blocked" => r.blocked.push((path, detail)),
+            "unschedulable" => r.unschedulable.push((path, detail)),
+            _ => {}
+        }
+    }
+    r
+}
+
+/// Closing File Explorer to free a file also removes the taskbar; bring it
+/// back from this (non-elevated) process so it runs as the user, not admin.
+fn ensure_explorer_running() {
+    use std::os::windows::process::CommandExt;
+    let running = std::process::Command::new("tasklist")
+        .args(["/FI", "IMAGENAME eq explorer.exe", "/NH"])
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("explorer.exe"))
+        .unwrap_or(true);
+    if !running {
+        let _ = std::process::Command::new("explorer.exe").spawn();
+    }
 }
 
 /// The shared "remove one stubborn path" routine, used by both force-delete
-/// and force-uninstall so anything that won't delete — a locked file, a
-/// folder with an open file inside, an ACL-protected program folder — is
-/// handled the same thorough way. `esc` is a PowerShell-single-quote-escaped
-/// path; the caller must have emitted `FORCE_DELETE_HELPER` earlier so the
-/// `SDForceDelete` type exists.
+/// and force-uninstall. `esc` is a PowerShell-single-quote-escaped path; the
+/// caller must have emitted `FORCE_DELETE_HELPER` earlier.
 ///
-/// Each cycle: close every process holding the path (or a file within it)
-/// open, then retry the delete — handles release asynchronously after a kill,
-/// and new lockers can appear after the first pass. On the second cycle it
-/// also takes ownership and grants Administrators full control, which is what
-/// lets it remove a stubborn program whose files are locked down by ACLs
-/// (common for preinstalled/system apps). Only if every attempt fails does it
-/// fall back to removal on the next full restart.
-pub(crate) fn robust_remove_block(esc: &str, permanent: bool) -> String {
+/// Each cycle: close the processes holding the path (or a file within it)
+/// that are safe to close — never Windows itself, services, critical system
+/// processes, a virtual machine, or this app — then retry the delete, since
+/// handles are released asynchronously after a kill and a program can
+/// re-open the file. If only uncloseable holders remain on two checks in a
+/// row, it stops early: retrying cannot succeed. Ownership is taken (to get
+/// past restrictive permissions) only when nothing holds the item open, so a
+/// file that ends up not deleted is not left with changed ownership.
+///
+/// Programs closed are appended to `$sdOut` when the caller defined it.
+/// `schedule_on_failure` schedules removal at the next restart if the item
+/// still exists afterwards (force-uninstall uses it; force-delete decides
+/// for itself).
+pub(crate) fn robust_remove_block(esc: &str, permanent: bool, schedule_on_failure: bool) -> String {
     let delete_attempt = if permanent {
         format!(
             "try {{ Remove-Item -LiteralPath '{esc}' -Recurse -Force -ErrorAction SilentlyContinue }} catch {{ }}\n"
@@ -1569,70 +1853,124 @@ pub(crate) fn robust_remove_block(esc: &str, permanent: bool) -> String {
     } else {
         recycle_item_script_commands(esc)
     };
+    let schedule = if schedule_on_failure {
+        format!("if (Test-Path -LiteralPath '{esc}') {{ [SDForceDelete]::ScheduleForReboot('{esc}') | Out-Null }}\n")
+    } else {
+        String::new()
+    };
     format!(
-        "for ($i = 0; $i -lt 10; $i++) {{\n\
-            try {{ foreach ($procId in [SDForceDelete]::FindLockerPids('{esc}')) {{ \
-                Stop-Process -Id $procId -Force -ErrorAction SilentlyContinue }} }} catch {{ }}\n\
-            if ($i -eq 1) {{\n\
+        "if ($null -eq $sdClosedExes) {{ $sdClosedExes = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase) }}\n\
+         $sdStuck = 0\n\
+         for ($i = 0; $i -lt 10; $i++) {{\n\
+            if (-not (Test-Path -LiteralPath '{esc}')) {{ break }}\n\
+            $sdL = @(); try {{ $sdL = @([SDForceDelete]::GetLockers('{esc}')) }} catch {{ }}\n\
+            foreach ($l in $sdL) {{ if ($l.Closable) {{ try {{\n\
+                $sdName = [SDForceDelete]::DisplayName($l)\n\
+                Stop-Process -Id $l.Pid -Force -ErrorAction Stop\n\
+                [void]$sdClosedExes.Add($l.Exe)\n\
+                if ($null -ne $sdOut) {{ $sdOut.Add(\"closed`t\" + '{esc}' + \"`t\" + $sdName) }}\n\
+            }} catch {{ }} }} }}\n\
+            $sdHeld = @($sdL | Where-Object {{ -not $_.Closable }}).Count\n\
+            if ($sdHeld -gt 0) {{ $sdStuck++; if ($sdStuck -ge 2) {{ break }} }} else {{ $sdStuck = 0 }}\n\
+            if ($i -eq 1 -and $sdL.Count -eq 0) {{\n\
                 try {{ & takeown /f '{esc}' /r /d y *>$null }} catch {{ }}\n\
                 try {{ & icacls '{esc}' /grant '*S-1-5-32-544:F' /t /c *>$null }} catch {{ }}\n\
             }}\n\
             Start-Sleep -Milliseconds 300\n\
+            if ($sdHeld -eq 0) {{\n\
             {delete_attempt}\
-            if (-not (Test-Path -LiteralPath '{esc}')) {{ break }}\n\
+            }}\n\
          }}\n\
-         if (Test-Path -LiteralPath '{esc}') {{ [SDForceDelete]::ScheduleForReboot('{esc}') | Out-Null }}\n"
+         {schedule}"
     )
 }
 
-/// Same shape as `build_delete_script`'s per-item recycle-bin snippet,
-/// factored out because `build_force_delete_script` needs it between two
-/// other steps rather than as the whole body of the loop.
+/// Silent Recycle Bin removal (or permanent, when the item cannot go to the
+/// Recycle Bin — see `SDForceDelete.Recycle`).
 fn recycle_item_script_commands(esc: &str) -> String {
-    format!(
-        "try {{ if (Test-Path -LiteralPath '{esc}' -PathType Container) {{ \
-            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory('{esc}','OnlyErrorDialogs','SendToRecycleBin') \
-         }} elseif (Test-Path -LiteralPath '{esc}') {{ \
-            [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile('{esc}','OnlyErrorDialogs','SendToRecycleBin') \
-         }} }} catch {{ }}\n"
-    )
+    format!("try {{ [void][SDForceDelete]::Recycle('{esc}') }} catch {{ }}\n")
 }
 
-/// True if `path` (or, for a folder, its own entry — `ScheduleForReboot`
-/// always adds the root last) is registered to be removed the next time
-/// Windows starts. Reading this key needs no elevation, unlike writing it.
+/// True only if `path` itself is registered in PendingFileRenameOperations
+/// for deletion at the next restart (a folder's own entry is always added,
+/// last). Exact match: a substring test would also match `C:\a\bc` for
+/// `C:\a\b`. Entries are stored as `\??\C:\path`; deletions have an empty
+/// destination. Reading this key needs no elevation.
 pub(crate) fn has_pending_reboot_delete(path: &str) -> bool {
     let Ok(key) =
         RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(r"SYSTEM\CurrentControlSet\Control\Session Manager")
     else {
         return false;
     };
-    let Ok(entries) = key.get_value::<Vec<String>, _>("PendingFileRenameOperations") else {
+    // Raw REG_MULTI_SZ, decoded by hand: the typed reader drops the empty
+    // strings that mark a deletion, which would misalign the pairs.
+    let Ok(raw) = key.get_raw_value("PendingFileRenameOperations") else {
         return false;
     };
-    let needle = path.to_lowercase();
-    entries.iter().any(|e| e.to_lowercase().contains(&needle))
+    let wide: Vec<u16> = raw
+        .bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect();
+    let text = String::from_utf16_lossy(&wide);
+    let mut parts: Vec<&str> = text.split('\0').collect();
+    // Drop the list terminator (trailing empty strings after the last pair).
+    while parts.len() % 2 == 1 || (parts.len() >= 2 && parts[parts.len() - 1].is_empty() && parts[parts.len() - 2].is_empty()) {
+        parts.pop();
+    }
+    pending_delete_pairs_contain(&parts, path)
+}
+
+/// `parts` = PendingFileRenameOperations as alternating (source, destination)
+/// strings. A deletion is a pair whose destination is empty. Sources are
+/// stored as `*1\??\C:\path` on current Windows (a `*<n>` flag prefix, then
+/// the NT `\??\` prefix) and as plain `\??\C:\path` on older entries.
+fn pending_delete_pairs_contain(parts: &[&str], path: &str) -> bool {
+    let norm = |s: &str| {
+        let s = match s.strip_prefix('*') {
+            Some(rest) => rest.trim_start_matches(|c: char| c.is_ascii_digit()),
+            None => s,
+        };
+        s.trim_start_matches('!')
+            .trim_start_matches(r"\??\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    };
+    let needle = norm(path);
+    parts
+        .chunks_exact(2)
+        .any(|pair| pair[1].is_empty() && !pair[0].is_empty() && norm(pair[0]) == needle)
 }
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ForceDeleteResult {
+    /// Bytes of the items that are now gone. When they went to the Recycle
+    /// Bin this space is NOT free yet — the UI words it accordingly.
     pub freed_bytes: u64,
-    /// Removed immediately, once whatever had them open was closed.
+    /// Gone from their location.
     pub removed: Vec<String>,
-    /// Not free yet — scheduled to be removed automatically the next time
-    /// the PC restarts, because nothing running right now could be made to
-    /// let go of them (a protected system process, most often).
+    /// Programs this run closed to free the items (their unsaved work is lost).
+    pub closed_programs: Vec<String>,
+    /// Still there, held open by something this app does not close — each
+    /// with the exact explanation of what holds it and what to do.
+    pub blocked: Vec<BlockedItem>,
+    /// Still there although nothing holds it open; set to be deleted
+    /// (permanently) during the next full restart. Not a promise: if a
+    /// program recreates the item at startup it will be back.
     pub scheduled_for_reboot: Vec<String>,
-    /// Could not be removed and could not even be scheduled — genuinely
-    /// stuck (very rare: a protected system file, or a folder too large to
-    /// schedule item-by-item safely).
-    pub failed: Vec<String>,
-    /// Names of programs still holding one of the paths open after every
-    /// attempt — what the user must close. Non-empty means a restart will not
-    /// help (the item is re-opened by something that survives it, e.g. a
-    /// running virtual machine or Windows itself).
-    pub blocked_by: Vec<String>,
+    /// Still there, nothing reported as holding it, and it could not be
+    /// scheduled either — each with the specific reason.
+    pub failed: Vec<BlockedItem>,
+    /// The administrator step did not run to completion.
+    pub elevation_declined: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct BlockedItem {
+    pub path: String,
+    pub reasons: Vec<String>,
 }
 
 /// Force-deletes paths that failed even an administrator-elevated delete —
@@ -1649,21 +1987,36 @@ pub async fn force_delete_paths(
     let label = source.unwrap_or_else(|| "Force delete".into());
     let permanent = permanent.unwrap_or(false);
     tauri::async_runtime::spawn_blocking(move || {
+        let (paths, refused) = split_refused(paths, true);
         let before: Vec<(String, cleaner::Measure)> = paths
             .iter()
             .map(|p| (p.clone(), measure_path(Path::new(p))))
             .collect();
 
-        let _ = std::fs::remove_file(force_delete_blockers_path());
-        let script = build_force_delete_script(&paths, permanent);
-        run_elevated_powershell(&script, "storage_doctor_force_delete.ps1")?;
-        let blocked_by = read_force_delete_blockers();
+        let report = if paths.is_empty() {
+            ForceReport { completed: true, ..Default::default() }
+        } else {
+            let report_path = new_force_report_path();
+            let script = build_force_delete_script(&paths, permanent, &report_path);
+            let run = run_elevated_powershell(&script, "storage_doctor_force_delete.ps1");
+            let report = read_force_report(&report_path);
+            ensure_explorer_running();
+            if let Err(e) = run {
+                if !report.completed {
+                    return Err(e);
+                }
+            }
+            report
+        };
 
         let mut removals: Vec<Removal> = Vec::new();
+        let mut blocked = Vec::new();
         let mut scheduled_for_reboot = Vec::new();
-        let mut failed = Vec::new();
+        // Refused items are reported with their reason, never processed.
+        let mut failed = refused;
 
         for (path, prior) in before {
+            let reasons = report.blocked_for(&path);
             let p = Path::new(&path);
             if !p.exists() {
                 let after = measure_path(p);
@@ -1676,10 +2029,19 @@ pub async fn force_delete_paths(
                         .saturating_sub(after.recoverable_bytes),
                     vanished: true,
                 });
-            } else if has_pending_reboot_delete(&path) {
+            } else if !reasons.is_empty() {
+                blocked.push(BlockedItem { path, reasons });
+            } else if report.completed && has_pending_reboot_delete(&path) {
                 scheduled_for_reboot.push(path);
             } else {
-                failed.push(path);
+                let reason = if !report.completed {
+                    "The administrator step stopped before finishing, so this item was not processed."
+                } else if report.unschedulable.iter().any(|(p, c)| p == &path && c.trim() == "1") {
+                    "No program has it open, but Windows refused to delete it, and it holds more than 2,000 files and folders — too many to schedule for deletion at restart."
+                } else {
+                    "No program has it open, but Windows refused to delete it and refused to schedule it for deletion at restart."
+                };
+                failed.push(BlockedItem { path, reasons: vec![reason.to_string()] });
             }
         }
 
@@ -1697,9 +2059,11 @@ pub async fn force_delete_paths(
         Ok(ForceDeleteResult {
             freed_bytes: freed,
             removed,
+            closed_programs: report.closed_programs(),
+            blocked,
             scheduled_for_reboot,
             failed,
-            blocked_by,
+            elevation_declined: !report.completed,
         })
     })
     .await
@@ -2240,10 +2604,17 @@ pub fn force_delete_cli(path: &str) {
         return;
     }
 
+    if let Some(why) = delete_refusal(path, true) {
+        message_box(&format!("Not deleted.\n\n{why}\n\n{path}"), front | MB_ICONERROR);
+        return;
+    }
+
     let confirm = message_box(
         &format!(
-            "Force delete this item?\n\n{path}\n\nAny program currently using it will be \
-             closed, and it will be moved to the Recycle Bin where possible."
+            "Force delete this item?\n\n{path}\n\n\
+             • Programs that have it open will be closed. Unsaved work in them is lost.\n\
+             • It goes to the Recycle Bin. An item too large for the Recycle Bin is \
+             deleted permanently."
         ),
         front | MB_YESNO | MB_ICONWARNING,
     );
@@ -2255,59 +2626,89 @@ pub fn force_delete_cli(path: &str) {
     let _ = trash::delete(path);
     if !Path::new(path).exists() {
         message_box(
-            &format!("Deleted — moved to the Recycle Bin:\n{path}"),
+            &format!("Moved to the Recycle Bin:\n{path}"),
             front | MB_ICONINFORMATION,
         );
         return;
     }
 
-    // 2) Still there → locked or permission-denied. One elevated pass closes
-    //    the locker and retries, and records what still holds it if it can't.
-    let _ = std::fs::remove_file(force_delete_blockers_path());
-    let script = build_force_delete_script(&[path.to_string()], false);
-    if let Err(e) = run_elevated_powershell(&script, "storage_doctor_force_delete_cli.ps1") {
+    // 2) Still there → locked or permission-denied. One elevated pass.
+    let report_path = new_force_report_path();
+    let script = build_force_delete_script(&[path.to_string()], false, &report_path);
+    let run = run_elevated_powershell(&script, "storage_doctor_force_delete_cli.ps1");
+    let report = read_force_report(&report_path);
+    ensure_explorer_running();
+
+    let closed = report.closed_programs();
+    let closed_note = if closed.is_empty() {
+        String::new()
+    } else {
+        format!("\n\nClosed to free it:\n• {}", closed.join("\n• "))
+    };
+
+    if !Path::new(path).exists() {
         message_box(
-            &format!("Could not force delete:\n{path}\n\n{e}"),
+            &format!(
+                "Deleted (sent to the Recycle Bin, or deleted permanently if it was too large \
+                 for it):\n{path}{closed_note}"
+            ),
+            front | MB_ICONINFORMATION,
+        );
+        return;
+    }
+
+    if !report.completed {
+        let why = run.err().unwrap_or_else(|| "The administrator step did not finish.".into());
+        message_box(
+            &format!(
+                "Not deleted. Windows refused a normal delete, and the administrator step \
+                 did not run:\n{why}\n\n{path}"
+            ),
             front | MB_ICONERROR,
         );
         return;
     }
 
-    let blockers = read_force_delete_blockers();
-    if !Path::new(path).exists() {
-        message_box(&format!("Deleted:\n{path}"), front | MB_ICONINFORMATION);
-    } else if !blockers.is_empty() {
-        // Be honest: name what is holding it, rather than promising a restart
-        // that will not help if that program re-opens the file at startup.
-        let who = blockers.join("\n• ");
-        let is_disk_image = path.to_lowercase().ends_with(".vhdx")
-            || path.to_lowercase().ends_with(".vhd");
-        let hint = if is_disk_image {
-            "\n\nThis is a virtual disk in use by a running virtual machine — quit the app \
-             that owns it (so its VM shuts down) and try again."
-        } else {
-            "\n\nClose that program (or uninstall it) and try again."
-        };
+    let reasons = report.blocked_for(path);
+    if !reasons.is_empty() {
         message_box(
             &format!(
-                "Could not delete — this item is still open in:\n• {who}{hint}\n\nA restart \
-                 will not remove it while that keeps it open:\n{path}"
+                "Not deleted — it is still in use by:\n\n• {}\n\nNothing was scheduled for \
+                 a restart: whatever holds it would hold it again.{closed_note}\n\n{path}",
+                reasons.join("\n• ")
             ),
             front | MB_ICONERROR,
         );
     } else if has_pending_reboot_delete(path) {
         message_box(
             &format!(
-                "This item is in use and has been scheduled for removal on the next restart.\n\n\
-                 Use Start ▸ Power ▸ Restart (a full restart, not Shut down — Windows Fast \
-                 Startup skips this step). If it is still there afterward, the program that \
-                 opens it must be closed first:\n{path}"
+                "Not deleted yet. No program has it open, but Windows still refused to \
+                 delete it now.\n\nIt is scheduled to be deleted permanently (not to the \
+                 Recycle Bin) during the next restart — use Start ▸ Power ▸ Restart, not \
+                 Shut down. If a program creates it again when Windows starts, it will \
+                 be back.{closed_note}\n\n{path}"
             ),
-            front | MB_ICONINFORMATION,
+            front | MB_ICONWARNING,
+        );
+    } else if report
+        .unschedulable
+        .iter()
+        .any(|(p, code)| p == path && code.trim() == "1")
+    {
+        message_box(
+            &format!(
+                "Not deleted. No program has it open, but Windows refused to delete it, and \
+                 it holds more than 2,000 files and folders — too many to schedule for \
+                 deletion at restart.{closed_note}\n\n{path}"
+            ),
+            front | MB_ICONERROR,
         );
     } else {
         message_box(
-            &format!("Could not delete — the item is still in use:\n{path}"),
+            &format!(
+                "Not deleted, and it could not be scheduled for deletion at restart \
+                 (Windows refused the request).{closed_note}\n\n{path}"
+            ),
             front | MB_ICONERROR,
         );
     }
@@ -2344,59 +2745,210 @@ mod tests {
     fn dump_force_delete_script() {
         let path = std::env::var("SD_FDTEST_PATH").expect("SD_FDTEST_PATH");
         let out = std::env::var("SD_FDTEST_OUT").expect("SD_FDTEST_OUT");
-        std::fs::write(&out, build_force_delete_script(&[path], false)).unwrap();
+        let report = std::env::var("SD_FDTEST_REPORT").expect("SD_FDTEST_REPORT");
+        std::fs::write(
+            &out,
+            build_force_delete_script(&[path], false, Path::new(&report)),
+        )
+        .unwrap();
+    }
+
+    /// LIVE, elevated (one UAC prompt): runs the real force-delete pipeline
+    /// on SD_LIVE_PATH and prints the outcome exactly as the app classifies it.
+    #[test]
+    #[ignore]
+    fn live_force_delete() {
+        let path = std::env::var("SD_LIVE_PATH").expect("SD_LIVE_PATH");
+        let report_path = new_force_report_path();
+        let script = build_force_delete_script(&[path.clone()], false, &report_path);
+        let run = run_elevated_powershell(&script, "sd_live_fd.ps1");
+        let r = read_force_report(&report_path);
+        println!("RUN={run:?}");
+        println!("COMPLETED={}", r.completed);
+        println!("EXISTS_AFTER={}", Path::new(&path).exists());
+        println!("CLOSED={:?}", r.closed_programs());
+        println!("BLOCKED={:?}", r.blocked_for(&path));
+        println!("UNSCHEDULABLE={:?}", r.unschedulable);
+        println!("PENDING_REBOOT={}", has_pending_reboot_delete(&path));
+    }
+
+    /// LIVE, elevated, READ-ONLY: reports what holds SD_LIVE_PATH open, using
+    /// the same GetLockers/Describe the app uses. Closes nothing, deletes
+    /// nothing — safe to point at a file in active use.
+    #[test]
+    #[ignore]
+    fn live_describe_lockers() {
+        let path = std::env::var("SD_LIVE_PATH").expect("SD_LIVE_PATH");
+        let report = new_force_report_path();
+        let esc = path.replace('\'', "''");
+        let rf = report.to_string_lossy().replace('\'', "''");
+        let script = format!(
+            "{FORCE_DELETE_HELPER}\n$o = New-Object 'System.Collections.Generic.List[string]'\n\
+             foreach ($l in @([SDForceDelete]::GetLockers('{esc}'))) {{ $o.Add(\"lock`t\" + $l.Pid + ' ' + $l.Exe + ' closable=' + $l.Closable + \"`t\" + [SDForceDelete]::Describe($l, $null)) }}\n\
+             $o.Add('done')\n[System.IO.File]::WriteAllLines('{rf}', $o)\n"
+        );
+        let run = run_elevated_powershell(&script, "sd_live_describe.ps1");
+        println!("RUN={run:?}");
+        println!("{}", std::fs::read_to_string(&report).unwrap_or_default());
+        let _ = std::fs::remove_file(&report);
+    }
+
+    /// LIVE, elevated: schedules SD_LIVE_PATH (a scratch file) for deletion at
+    /// the next restart via the app's own ScheduleForReboot, then checks the
+    /// exact-match detection against the real registry value.
+    #[test]
+    #[ignore]
+    fn live_schedule_detection() {
+        let path = std::env::var("SD_LIVE_PATH").expect("SD_LIVE_PATH");
+        let esc = path.replace('\'', "''");
+        let script = format!("{FORCE_DELETE_HELPER}\n[void][SDForceDelete]::ScheduleForReboot('{esc}')\n");
+        println!("RUN={:?}", run_elevated_powershell(&script, "sd_live_sched.ps1"));
+        println!("EXACT={}", has_pending_reboot_delete(&path));
+        println!("PREFIX_ONLY={}", has_pending_reboot_delete(&path[..path.len() - 1]));
+        println!("LONGER={}", has_pending_reboot_delete(&format!("{path}x")));
+    }
+
+    fn script_for(path: &str, permanent: bool) -> String {
+        build_force_delete_script(&[path.to_string()], permanent, Path::new(r"C:\r.txt"))
     }
 
     #[test]
-    fn force_delete_script_stops_lockers_before_deleting_and_schedules_reboot_fallback() {
-        let script = build_force_delete_script(&[r"C:\stuck\file.txt".to_string()], false);
-        assert!(script.contains("FindLockerPids"));
-        assert!(script.contains("Stop-Process -Id $procId"));
-        assert!(script.contains("SendToRecycleBin"));
-        assert!(script.contains("ScheduleForReboot"));
-        // Recycle Bin path is used, not a permanent Remove-Item.
+    fn force_delete_script_closes_lockers_before_deleting() {
+        let script = script_for(r"C:\stuck\file.txt", false);
+        assert!(script.contains("Stop-Process -Id $l.Pid"));
+        assert!(script.contains("[SDForceDelete]::Recycle('C:\\stuck\\file.txt')"));
+        // No VisualBasic recycle in the force path: it pops "File In Use"
+        // dialogs from the hidden elevated process.
+        assert!(!script.contains("SendToRecycleBin"));
         assert!(!script.contains(r"Remove-Item -LiteralPath 'C:\stuck\file.txt' -Recurse"));
-        // The kill step must run, and finish, before the delete attempt.
-        let kill_pos = script.find("FindLockerPids").unwrap();
-        let delete_pos = script.find("SendToRecycleBin").unwrap();
+        let kill_pos = script.find("Stop-Process -Id $l.Pid").unwrap();
+        let delete_pos = script.find("::Recycle('").unwrap();
         assert!(kill_pos < delete_pos, "processes must be stopped before deleting");
     }
 
     #[test]
+    fn force_delete_only_closes_processes_marked_closable() {
+        let script = script_for(r"C:\stuck\file.txt", false);
+        assert!(script.contains("if ($l.Closable)"));
+        // Never: System, services, critical processes, the VM worker, itself.
+        for name in ["\"svchost\"", "\"csrss\"", "\"lsass\"", "\"vmwp\"", "\"vmmem\"", "\"storage-doctor\""] {
+            assert!(script.contains(name), "{name} must be in the never-close list");
+        }
+        assert!(script.contains("l.Type != 3"), "services are never killed");
+        assert!(script.contains("l.Type != 1000"), "critical processes are never killed");
+        assert!(script.contains("pid > 4"), "System is never killed");
+    }
+
+    #[test]
+    fn force_delete_never_schedules_a_restart_when_something_holds_the_item() {
+        let script = script_for(r"C:\stuck\file.txt", false);
+        // The force-delete routine itself must not schedule…
+        let routine = robust_remove_block("C:\\x", false, false);
+        assert!(!routine.contains("ScheduleForReboot"));
+        // …and the script schedules only in the branch where no locker remains.
+        let blocked = script.find("if ($sdLeft.Count -gt 0)").unwrap();
+        let sched = script.find("$sdR = [SDForceDelete]::ScheduleForReboot").unwrap();
+        let else_pos = script[blocked..].find("} else {").unwrap() + blocked;
+        assert!(sched > else_pos, "scheduling must be in the no-locker branch only");
+        // Force-uninstall keeps its restart fallback.
+        assert!(robust_remove_block("C:\\x", false, true).contains("ScheduleForReboot"));
+    }
+
+    #[test]
+    fn ownership_is_taken_only_when_nothing_holds_the_item() {
+        let routine = robust_remove_block("C:\\x", false, false);
+        assert!(routine.contains("if ($i -eq 1 -and $sdL.Count -eq 0)"));
+    }
+
+    #[test]
     fn force_delete_script_permanent_mode_skips_the_recycle_bin() {
-        let script = build_force_delete_script(&[r"C:\stuck\file.txt".to_string()], true);
+        let script = script_for(r"C:\stuck\file.txt", true);
         assert!(script.contains(r"Remove-Item -LiteralPath 'C:\stuck\file.txt' -Recurse -Force"));
-        assert!(!script.contains("SendToRecycleBin"));
+        assert!(!script.contains("::Recycle('"));
     }
 
     #[test]
     fn force_delete_script_retries_the_delete_and_is_folder_aware() {
-        let script = build_force_delete_script(&[r"C:\stuck".to_string()], false);
-        // The delete is retried in a loop, re-killing lockers each cycle — a
-        // killed process releases handles asynchronously, and new lockers can
-        // appear after the first pass.
+        let script = script_for(r"C:\stuck", false);
         assert!(script.contains("for ($i = 0; $i -lt 10; $i++)"));
-        assert!(script.contains("break"));
-        // The kill *call* runs inside the loop, not once before it. (The name
-        // also appears earlier in the C# helper definition, so match the call
-        // site specifically.)
         let loop_pos = script.find("for ($i = 0; $i -lt 10").unwrap();
-        let call_pos = script.find("::FindLockerPids(").unwrap();
-        assert!(call_pos > loop_pos, "locker kill must be inside the retry loop");
-        // Locker discovery collects the files inside a folder (so a process
-        // holding a file *within* the target is found), not just the target.
+        let call_pos = script.find("[SDForceDelete]::GetLockers('C:\\stuck')").unwrap();
+        assert!(call_pos > loop_pos, "locker lookup must be inside the retry loop");
         assert!(script.contains("CollectFilesForRm"));
         assert!(script.contains("ResourcesFor"));
+        // Report written and terminated with a completion marker.
+        assert!(script.contains("$sdOut.Add('done')"));
+        assert!(script.contains(r"WriteAllLines('C:\r.txt', $sdOut)"));
     }
 
     #[test]
     fn force_delete_script_escapes_single_quotes_in_paths() {
-        // A literal `'` inside a PowerShell single-quoted string must be
-        // doubled, or the script fails to parse (or worse, terminates the
-        // string early against attacker-controlled-looking content).
-        let script = build_force_delete_script(&[r"C:\it's\stuck.txt".to_string()], false);
+        let script = script_for(r"C:\it's\stuck.txt", false);
         assert!(script.contains(r"it''s"));
         assert!(!script.contains(r"'C:\it's\stuck.txt'"));
+    }
+
+    #[test]
+    fn refuses_drives_core_folders_and_force_inside_windows_only() {
+        let win = std::env::var("SystemRoot").unwrap();
+        let pf = std::env::var("ProgramFiles").unwrap();
+        let profile = std::env::var("USERPROFILE").unwrap();
+        // Drives and core folders: refused for every kind of delete.
+        for p in ["C:\\", "C:", win.as_str(), pf.as_str(), profile.as_str()] {
+            assert!(delete_refusal(p, false).is_some(), "{p} must be refused");
+            assert!(delete_refusal(p, true).is_some(), "{p} must be refused");
+        }
+        assert!(delete_refusal(&format!("{win}\\"), false).is_some(), "trailing slash");
+        assert!(delete_refusal(&win.to_uppercase(), false).is_some(), "case-insensitive");
+        // Inside Windows: allowed for a normal (cleanup) delete, refused for force…
+        let sys32 = format!("{win}\\System32\\drivers");
+        assert!(delete_refusal(&sys32, false).is_none());
+        assert!(delete_refusal(&sys32, true).is_some());
+        // …except the cleanup folders the app's recommendations target.
+        for c in ["Temp", "Temp\\a.tmp", "Logs\\CBS", "Minidump", "SoftwareDistribution\\Download\\x"] {
+            assert!(delete_refusal(&format!("{win}\\{c}"), true).is_none(), "{c} must be allowed");
+        }
+        assert!(delete_refusal(&format!("{win}\\SoftwareDistribution"), true).is_some());
+        assert!(delete_refusal(&format!("{win}\\TempX"), true).is_some(), "no prefix match");
+        // Ordinary items are never refused.
+        assert!(delete_refusal(&format!("{pf}\\SomeApp"), true).is_none());
+        assert!(delete_refusal(&format!("{profile}\\Downloads\\a.zip"), true).is_none());
+    }
+
+    #[test]
+    fn pending_delete_pairs_match_exactly() {
+        let parts = [
+            r"\??\C:\a\b", "",                 // delete C:\a\b (older format)
+            r"\??\C:\a\old", r"!\??\C:\a\new", // a rename, not a delete
+            r"*1\??\C:\x\y.txt", "",           // delete, current Windows format
+        ];
+        assert!(pending_delete_pairs_contain(&parts, r"C:\x\y.txt"), "*1 prefix must be handled");
+        assert!(!pending_delete_pairs_contain(&parts, r"C:\x\y.tx"));
+        assert!(pending_delete_pairs_contain(&parts, r"C:\a\b"));
+        assert!(pending_delete_pairs_contain(&parts, r"c:\A\B\"));
+        assert!(!pending_delete_pairs_contain(&parts, r"C:\a"), "no prefix match");
+        assert!(!pending_delete_pairs_contain(&parts, r"C:\a\bc"));
+        assert!(!pending_delete_pairs_contain(&parts, r"C:\a\old"), "a rename is not a delete");
+    }
+
+    #[test]
+    fn force_report_parses_every_line_kind() {
+        let dir = std::env::temp_dir().join(format!("sd_report_test_{}", std::process::id()));
+        std::fs::write(
+            &dir,
+            "\u{feff}closed\tC:\\a\tWINWORD.exe\nclosed\tC:\\b\tWINWORD.exe\n\
+             blocked\tC:\\c\tWindows itself\nunschedulable\tC:\\d\t1\ndone\n",
+        )
+        .unwrap();
+        let r = read_force_report(&dir);
+        assert!(r.completed);
+        assert_eq!(r.closed_programs(), vec!["WINWORD.exe".to_string()]);
+        assert_eq!(r.blocked_for("C:\\c"), vec!["Windows itself".to_string()]);
+        assert!(r.blocked_for("C:\\a").is_empty());
+        assert_eq!(r.unschedulable, vec![("C:\\d".to_string(), "1".to_string())]);
+        assert!(!dir.exists(), "report is deleted after reading");
+        // Missing file = the elevated step never ran.
+        assert!(!read_force_report(&dir).completed);
     }
 
     /// Read-only against the real machine — safe, no side effects. A path

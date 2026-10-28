@@ -956,7 +956,7 @@ pub fn build_force_uninstall_script(app: &InstalledApp) -> (String, bool) {
     // mistaken uninstall is still recoverable from the Recycle Bin.
     for path in remaining_paths(app) {
         let esc = path.to_string_lossy().replace('\'', "''");
-        script.push_str(&crate::commands::robust_remove_block(&esc, false));
+        script.push_str(&crate::commands::robust_remove_block(&esc, false, true));
     }
     for (hive, path) in find_uninstall_key_paths(&app.name) {
         let root = match hive {

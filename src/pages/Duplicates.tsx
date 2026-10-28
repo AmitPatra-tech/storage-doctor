@@ -3,7 +3,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { CopyCheck, FolderOpen, FolderSearch, Loader2, Trash2 } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { refreshAfterCleanup } from "@/lib/refresh";
-import { formatBytes } from "@/lib/utils";
+import { formatBytes, removalNotice } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -77,19 +77,21 @@ export function Duplicates() {
     return { selectedItems: items, wastedBytes: wasted };
   }, [groups, selected]);
 
-  const afterDelete = (freed: number) => {
+  const afterDelete = (bytes: number, remaining: string[]) => {
     setConfirmOpen(false);
+    // Drop only what is actually gone; anything not removed stays listed.
+    const gone = new Set([...selected].filter((p) => !remaining.includes(p)));
     setGroups(
       (prev) =>
         prev
           ?.map((g) => ({
             ...g,
-            files: g.files.filter((f) => !selected.has(f.path)),
+            files: g.files.filter((f) => !gone.has(f.path)),
           }))
           .filter((g) => g.files.length > 1) ?? null
     );
-    setSelected(new Set());
-    setNotice(`Freed ${formatBytes(freed)} — files are in the Recycle Bin.`);
+    setSelected(new Set(remaining));
+    setNotice(removalNotice(bytes, false, remaining.length));
     refreshAfterCleanup(queryClient);
   };
 

@@ -3,7 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { EyeOff, FolderOpen, Trash2 } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { refreshAfterCleanup } from "@/lib/refresh";
-import { formatBytes } from "@/lib/utils";
+import { formatBytes, removalNotice } from "@/lib/utils";
 import { RiskBadge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -41,8 +41,8 @@ export function Recommendations() {
     },
   }));
 
-  const afterDelete = async (freed: number) => {
-    setNotice(`Freed ${formatBytes(freed)} — caches permanently removed to reclaim space.`);
+  const afterDelete = async (bytes: number, remaining: string[]) => {
+    setNotice(removalNotice(bytes, true, remaining.length));
     setTarget(null);
     // Re-measure so cleaned recommendations drop off / update their size.
     await backend.regenerateRecommendations();

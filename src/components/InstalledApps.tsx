@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { refreshAfterCleanup } from "@/lib/refresh";
-import { formatBytes } from "@/lib/utils";
+import { formatBytes, removalNotice } from "@/lib/utils";
 import type { AppUsage, ForceUninstallReport, InstalledApp, Leftover } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -210,9 +210,7 @@ function UninstallPanel({ app, onClose }: { app: InstalledApp; onClose: () => vo
               </div>
             )}
             {freed !== null && (
-              <p className="text-xs text-success">
-                Freed {formatBytes(freed)} — files are in the Recycle Bin.
-              </p>
+              <p className="text-xs text-success">{removalNotice(freed, false)}</p>
             )}
           </div>
         )}
@@ -541,8 +539,8 @@ export function InstalledApps() {
         knownTotalBytes={cleanTarget?.total}
         source={cleanTarget ? `${cleanTarget.name} caches` : undefined}
         permanent
-        onDone={(freed) => {
-          setNotice(`Freed ${formatBytes(freed)} — caches permanently removed to reclaim space.`);
+        onDone={(bytes, remaining) => {
+          setNotice(removalNotice(bytes, true, remaining.length));
           setCleanTarget(null);
           refreshAfterCleanup(queryClient);
         }}

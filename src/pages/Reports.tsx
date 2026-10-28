@@ -15,10 +15,35 @@ function formatDate(iso: string): string {
   return d.toLocaleString();
 }
 
+/** Methods are recorded as "permanent", "recycle", with "-admin" / "force-"
+ *  variants. Only permanent deletions free disk space; Recycle Bin moves
+ *  keep using it until the bin is emptied. */
+const isPermanent = (op: OperationRecord) => op.method.includes("permanent");
+
+function methodLabel(op: OperationRecord): string {
+  const where = isPermanent(op) ? "Permanently deleted" : "Moved to Recycle Bin";
+  const how = op.method.startsWith("force-")
+    ? " · force delete"
+    : op.method.endsWith("-admin")
+      ? " · admin"
+      : "";
+  return where + how;
+}
+
+function totals(ops: OperationRecord[]) {
+  let freed = 0;
+  let recycled = 0;
+  for (const op of ops) {
+    if (isPermanent(op)) freed += op.freedBytes;
+    else recycled += op.freedBytes;
+  }
+  return { freed, recycled };
+}
+
 async function buildPdf(ops: OperationRecord[]): Promise<Uint8Array> {
   const { jsPDF } = await import("jspdf");
   const doc = new jsPDF();
-  const total = ops.reduce((s, o) => s + o.freedBytes, 0);
+  const { freed, recycled } = totals(ops);
 
   doc.setFontSize(18);
   doc.text("Storage Doctor — Cleanup Report", 14, 20);
@@ -29,16 +54,18 @@ async function buildPdf(ops: OperationRecord[]): Promise<Uint8Array> {
   doc.setTextColor(0);
 
   doc.setFontSize(12);
-  doc.text(`Total space reclaimed: ${formatBytes(total)}`, 14, 42);
-  doc.text(`Operations recorded: ${ops.length}`, 14, 48);
+  doc.text(`Space freed (permanently deleted): ${formatBytes(freed)}`, 14, 42);
+  doc.text(`Moved to the Recycle Bin: ${formatBytes(recycled)}`, 14, 48);
+  doc.text(`Operations recorded: ${ops.length}`, 14, 54);
 
-  let y = 60;
+  let y = 66;
   doc.setFontSize(10);
   doc.setTextColor(120);
   doc.text("Date", 14, y);
-  doc.text("Action", 70, y);
-  doc.text("Items", 140, y);
-  doc.text("Freed", 165, y);
+  doc.text("Action", 58, y);
+  doc.text("Method", 112, y);
+  doc.text("Items", 158, y);
+  doc.text("Size", 175, y);
   doc.setTextColor(0);
   doc.line(14, y + 1.5, 196, y + 1.5);
   y += 7;
@@ -49,9 +76,10 @@ async function buildPdf(ops: OperationRecord[]): Promise<Uint8Array> {
       y = 20;
     }
     doc.text(formatDate(op.performedAt).slice(0, 22), 14, y);
-    doc.text(op.source.slice(0, 34), 70, y);
-    doc.text(String(op.itemCount), 140, y);
-    doc.text(formatBytes(op.freedBytes), 165, y);
+    doc.text(op.source.slice(0, 28), 58, y);
+    doc.text(methodLabel(op).slice(0, 26), 112, y);
+    doc.text(String(op.itemCount), 158, y);
+    doc.text(formatBytes(op.freedBytes), 175, y);
     y += 6.5;
   }
 
@@ -67,7 +95,7 @@ export function Reports() {
     queryFn: backend.getOperations,
   });
 
-  const totalFreed = (operations ?? []).reduce((s, o) => s + o.freedBytes, 0);
+  const { freed: totalFreed, recycled: totalRecycled } = totals(operations ?? []);
 
   const exportPdf = async () => {
     if (!operations || operations.length === 0) return;
@@ -106,9 +134,16 @@ export function Reports() {
 
       <Card className="mb-4">
         <CardContent className="flex items-center justify-between p-5">
-          <div>
-            <div className="text-sm text-muted">Total space reclaimed</div>
-            <div className="text-2xl font-semibold text-success">{formatBytes(totalFreed)}</div>
+          <div className="flex gap-8">
+            <div>
+              <div className="text-sm text-muted">Space freed (permanently deleted)</div>
+              <div className="text-2xl font-semibold text-success">{formatBytes(totalFreed)}</div>
+            </div>
+            <div>
+              <div className="text-sm text-muted">Moved to the Recycle Bin</div>
+              <div className="text-2xl font-semibold">{formatBytes(totalRecycled)}</div>
+              <div className="text-xs text-muted">Freed only when the Recycle Bin is emptied</div>
+            </div>
           </div>
           <div className="text-right">
             <div className="text-sm text-muted">Operations recorded</div>
@@ -138,11 +173,12 @@ export function Reports() {
               <div className="min-w-0 flex-1">
                 <div className="font-medium">{op.source}</div>
                 <div className="text-xs text-muted">
-                  {formatDate(op.performedAt)} · {op.itemCount} item(s)
-                  {op.method === "recycle-admin" && " · admin"}
+                  {formatDate(op.performedAt)} · {op.itemCount} item(s) · {methodLabel(op)}
                 </div>
               </div>
-              <div className="shrink-0 text-success">{formatBytes(op.freedBytes)}</div>
+              <div className={`shrink-0 ${isPermanent(op) ? "text-success" : "text-muted"}`}>
+                {formatBytes(op.freedBytes)}
+              </div>
             </div>
           ))}
         </CardContent>

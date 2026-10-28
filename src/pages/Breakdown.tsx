@@ -12,7 +12,7 @@ import {
 } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { refreshAfterCleanup } from "@/lib/refresh";
-import { formatBytes, formatPercent, formatRelativeTime } from "@/lib/utils";
+import { formatBytes, formatPercent, formatRelativeTime, removalNotice } from "@/lib/utils";
 import type { Classification, SafeItem } from "@/lib/types";
 import { SafetyBadge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -48,7 +48,7 @@ function SafeCleanModal({
 }: {
   folderPath: string;
   onClose: () => void;
-  onDeleted: (freed: number) => void;
+  onDeleted: (freed: number, notRemoved: number) => void;
 }) {
   const [selected, setSelected] = useState<Set<string> | null>(null);
   const [busy, setBusy] = useState(false);
@@ -84,15 +84,16 @@ function SafeCleanModal({
         true
       );
       let freed = res.freedBytes;
+      let notRemoved = 0;
       // Auto-retry any that need admin rights (one UAC prompt).
       if (res.failed.length > 0) {
         const elevated = await backend.deletePathsElevated(res.failed, "Safe cleanup", true);
         freed += elevated.freedBytes;
-        if (elevated.failed.length > 0) {
-          setError(`${elevated.failed.length} item(s) could not be removed.`);
-        }
+        notRemoved = elevated.failed.length;
       }
-      onDeleted(freed);
+      // Reported in the page notice: this dialog closes on completion, so an
+      // error set here would never be seen.
+      onDeleted(freed, notRemoved);
     } catch (e) {
       setError(String(e));
       setBusy(false);
@@ -300,17 +301,17 @@ export function Breakdown() {
     .map((r) => ({ path: r.path, sizeBytes: r.sizeBytes, classification: r.classification }));
   const selectedBytes = selectedRows.reduce((s, r) => s + r.sizeBytes, 0);
 
-  const finishDelete = (freed: number, message: string) => {
+  const finishDelete = (bytes: number, permanent: boolean, notRemoved: number) => {
     setConfirmOpen(false);
     setCleanTarget(null);
     setSelected(new Set());
-    setNotice(`Freed ${formatBytes(freed)} — ${message}`);
+    setNotice(removalNotice(bytes, permanent, notRemoved));
     refreshAfterCleanup(queryClient);
   };
-  const afterDelete = (freed: number) =>
-    finishDelete(freed, "items moved to the Recycle Bin.");
-  const afterSafeClean = (freed: number) =>
-    finishDelete(freed, "caches permanently removed to reclaim space.");
+  const afterDelete = (bytes: number, remaining: string[]) =>
+    finishDelete(bytes, false, remaining.length);
+  const afterSafeClean = (bytes: number, notRemoved: number) =>
+    finishDelete(bytes, true, notRemoved);
 
   return (
     <div>

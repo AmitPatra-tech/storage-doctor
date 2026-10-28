@@ -96,21 +96,35 @@ export interface DupeProgress {
 
 export interface DeleteResult {
   freedBytes: number;
+  /** Windows refused — can be retried as administrator. */
   failed: string[];
+  /** Never deleted by this app (a drive, a core folder…), with the reason. */
+  refused: ItemNote[];
+}
+
+/** An item that is still there, with the exact reason(s). */
+export interface ItemNote {
+  path: string;
+  reasons: string[];
 }
 
 export interface ForceDeleteResult {
+  /** Size of the items now gone. Not free disk space while they sit in the
+   *  Recycle Bin. */
   freedBytes: number;
-  /** Removed immediately, once whatever had them open was closed. */
+  /** Gone from their location. */
   removed: string[];
-  /** A restart removal was scheduled as a last resort. Unreliable — kept only
-   *  as a fallback, never promised. */
+  /** Programs that were closed to free the items (unsaved work lost). */
+  closedPrograms: string[];
+  /** Still there — held open by something this app does not close. */
+  blocked: ItemNote[];
+  /** Still there; nothing holds it; set to be deleted permanently during the
+   *  next restart. Not guaranteed if a program recreates it at startup. */
   scheduledForReboot: string[];
-  /** Genuinely could not be handled at all. */
-  failed: string[];
-  /** Programs still holding an item open — what the user must close. When
-   *  non-empty, a restart will not help. */
-  blockedBy: string[];
+  /** Still there and could not be scheduled — with the reason. */
+  failed: ItemNote[];
+  /** The administrator step stopped before finishing. */
+  elevationDeclined: boolean;
 }
 
 export interface ForceUninstallStep {

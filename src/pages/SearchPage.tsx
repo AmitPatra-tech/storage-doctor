@@ -15,7 +15,7 @@ import {
 import { useNavigate } from "react-router-dom";
 import { backend } from "@/lib/backend";
 import { refreshAfterCleanup } from "@/lib/refresh";
-import { formatBytes } from "@/lib/utils";
+import { formatBytes, removalNotice } from "@/lib/utils";
 import type { SearchResultItem } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -164,10 +164,11 @@ export function SearchPage() {
     else if (result.path) backend.revealInExplorer(result.path);
   };
 
-  const afterDelete = (freed: number) => {
-    const removed = deleteTarget?.path;
+  const afterDelete = (bytes: number, remaining: string[]) => {
+    const target = deleteTarget?.path;
+    const removed = target && !remaining.includes(target) ? target : undefined;
     setDeleteTarget(null);
-    setNotice(`Freed ${formatBytes(freed)} — item moved to the Recycle Bin.`);
+    setNotice(removalNotice(bytes, false, remaining.length));
     if (removed) {
       setDeepResults((prev) => prev?.filter((r) => r.path !== removed) ?? null);
     }
@@ -188,11 +189,13 @@ export function SearchPage() {
 
   const selectedDeepItems = (deepResults ?? []).filter((r) => deepSelected.has(r.path));
 
-  const afterBulkDelete = (freed: number) => {
-    const removed = new Set(selectedDeepItems.map((r) => r.path));
+  const afterBulkDelete = (bytes: number, remaining: string[]) => {
+    const removed = new Set(
+      selectedDeepItems.map((r) => r.path).filter((p) => !remaining.includes(p))
+    );
     setBulkConfirm(false);
-    setDeepSelected(new Set());
-    setNotice(`Freed ${formatBytes(freed)} — items are in the Recycle Bin.`);
+    setDeepSelected(new Set(remaining));
+    setNotice(removalNotice(bytes, false, remaining.length));
     setDeepResults((prev) => prev?.filter((r) => !removed.has(r.path)) ?? null);
     refreshAfterCleanup(queryClient);
   };

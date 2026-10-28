@@ -26,6 +26,34 @@ import type {
 // remains workable; inside the Tauri webview `__TAURI_INTERNALS__` exists.
 const isTauri = "__TAURI_INTERNALS__" in window;
 
+/** Browser-preview delete. Setting localStorage "sd-mock-fail" to "1" makes
+ *  every delete fail, so the administrator and force-delete screens can be
+ *  previewed. Never used inside the app itself. */
+function mockDelete(paths: string[]): DeleteResult {
+  let fail = false;
+  try {
+    fail = localStorage.getItem("sd-mock-fail") === "1";
+  } catch {
+    /* storage unavailable */
+  }
+  // Mirrors the backend's delete_refusal for the preview's sample folders.
+  const core = ["c:\\windows", "c:\\program files", "c:\\program files (x86)", "c:\\programdata", "c:\\users"];
+  const isRefused = (p: string) => {
+    const t = p.replace(/\\+$/, "").toLowerCase();
+    return t.length <= 2 || core.includes(t);
+  };
+  const refused = paths.filter(isRefused).map((path) => ({
+    path,
+    reasons: [
+      "This is a core Windows or user folder. Deleting it would break Windows or your programs, so Storage Doctor never deletes it.",
+    ],
+  }));
+  const rest = paths.filter((p) => !isRefused(p));
+  return fail
+    ? { freedBytes: 0, failed: rest, refused }
+    : { freedBytes: rest.length * 2 ** 20, failed: [], refused };
+}
+
 async function invoke<T>(command: string, args?: Record<string, unknown>): Promise<T> {
   const { invoke } = await import("@tauri-apps/api/core");
   return invoke<T>(command, args);
@@ -454,7 +482,7 @@ export const backend = {
     source?: string,
     permanent = false
   ): Promise<DeleteResult> {
-    if (!isTauri) return { freedBytes: paths.length * 2 ** 20, failed: [] };
+    if (!isTauri) return mockDelete(paths);
     return invoke<DeleteResult>("delete_paths", { paths, source, permanent });
   },
 
@@ -464,22 +492,36 @@ export const backend = {
     source?: string,
     permanent = false
   ): Promise<DeleteResult> {
-    if (!isTauri) return { freedBytes: paths.length * 2 ** 20, failed: [] };
+    if (!isTauri) return mockDelete(paths);
     return invoke<DeleteResult>("delete_paths_elevated", { paths, source, permanent });
   },
 
   /** Last resort for paths that failed even an administrator-elevated
-   *  delete — "this file is open in another program". Closes whatever has
-   *  each one open and retries; anything still locked afterward is
-   *  scheduled to be removed automatically next time the PC restarts. One
-   *  UAC prompt. */
+   *  delete. Closes the programs that hold each one open (only ones that are
+   *  safe to close) and retries. Anything still held is reported with what
+   *  holds it; a restart deletion is scheduled only when nothing holds it.
+   *  One UAC prompt. */
   async forceDeletePaths(
     paths: string[],
     source?: string,
     permanent = false
   ): Promise<ForceDeleteResult> {
     if (!isTauri) {
-      return { freedBytes: paths.length * 2 ** 20, removed: paths, scheduledForReboot: [], failed: [], blockedBy: [] };
+      // Browser preview: one of each outcome, so every result view renders.
+      const [a, b, c, d] = paths;
+      return {
+        freedBytes: a ? 2 ** 20 : 0,
+        removed: a ? [a] : [],
+        closedPrograms: a ? ["Microsoft Word (WINWORD.exe)"] : [],
+        blocked: b
+          ? [{ path: b, reasons: ["Windows itself (the System process). This happens when a virtual machine (Hyper-V, WSL, an app's built-in VM) or a driver is using the file. Quit the app that owns the virtual machine, then try again."] }]
+          : [],
+        scheduledForReboot: c ? [c] : [],
+        failed: d
+          ? [{ path: d, reasons: ["No program has it open, but Windows refused to delete it and refused to schedule it for deletion at restart."] }]
+          : [],
+        elevationDeclined: false,
+      };
     }
     return invoke<ForceDeleteResult>("force_delete_paths", { paths, source, permanent });
   },

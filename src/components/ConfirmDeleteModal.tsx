@@ -1,11 +1,11 @@
 import { useEffect, useState } from "react";
-import { Clock, ShieldAlert, Trash2, Zap } from "lucide-react";
+import { CheckCircle2, Clock, ShieldAlert, Trash2, XCircle, Zap } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
 import { Button } from "@/components/ui/button";
 import { SafetyBadge } from "@/components/ui/badge";
 import { formatBytes } from "@/lib/utils";
 import { useSmartDelete } from "@/hooks/useSmartDelete";
-import type { Classification } from "@/lib/types";
+import type { Classification, ItemNote } from "@/lib/types";
 
 export interface DeleteItem {
   path: string;
@@ -18,12 +18,52 @@ export interface DeleteItem {
  *  need different explanations and actions. */
 type Attempt = "none" | "elevated" | "force";
 
+/** What has been removed so far, worded for what actually happened to the
+ *  space: permanently deleted items free it; Recycle Bin items do not until
+ *  the bin is emptied. */
+function progressNote(bytes: number, permanent: boolean): string {
+  if (bytes <= 0) return "";
+  return permanent
+    ? `${formatBytes(bytes)} deleted so far.`
+    : `${formatBytes(bytes)} moved to the Recycle Bin so far.`;
+}
+
+function PathList({ paths }: { paths: string[] }) {
+  return (
+    <div className="mt-2 flex flex-col divide-y divide-border">
+      {paths.map((path) => (
+        <div key={path} className="truncate py-1 text-xs text-muted" title={path}>
+          {path}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function NoteList({ notes }: { notes: ItemNote[] }) {
+  return (
+    <div className="mt-2 flex flex-col divide-y divide-border">
+      {notes.map((n) => (
+        <div key={n.path} className="py-1.5">
+          <div className="truncate text-xs font-medium text-foreground" title={n.path}>
+            {n.path}
+          </div>
+          <ul className="mt-0.5 list-disc pl-5 text-xs text-muted">
+            {n.reasons.map((r) => (
+              <li key={r}>{r}</li>
+            ))}
+          </ul>
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /** Confirmation dialog that owns the deletion: moves items to the Recycle
- *  Bin, and if any fail offers first an administrator-elevated retry, then —
- *  for whatever is still locked open by something else even as
- *  administrator — a force-delete retry that closes whatever has it open, or
- *  schedules it for removal on the next restart. Calls `onDone(freed)` when
- *  finished. */
+ *  Bin (or deletes them permanently), and if any fail offers first an
+ *  administrator retry, then a force delete that closes the programs holding
+ *  them. Every result is reported per item, exactly as it happened. Calls
+ *  `onDone(bytes)` with the size of what was removed. */
 export function ConfirmDeleteModal({
   open,
   title,
@@ -43,45 +83,53 @@ export function ConfirmDeleteModal({
   source?: string;
   /** Permanently delete (frees space) instead of moving to the Recycle Bin. */
   permanent?: boolean;
-  onDone: (freedBytes: number) => void;
+  /** `removedBytes`: size of what is gone. `remaining`: paths still there. */
+  onDone: (removedBytes: number, remaining: string[]) => void;
   onClose: () => void;
 }) {
-  const { busy, failed, scheduledForReboot, blockedBy, freed, error, run, forceDelete, reset } =
+  const { busy, failed, refused, forceResult, freed, error, run, forceDelete, reset } =
     useSmartDelete();
   const [attempt, setAttempt] = useState<Attempt>("none");
+  /** The first delete has run — the item list gives way to results. */
+  const [started, setStarted] = useState(false);
 
   useEffect(() => {
     if (open) {
       reset();
       setAttempt("none");
+      setStarted(false);
     }
   }, [open, reset]);
 
   const total = knownTotalBytes ?? items.reduce((sum, i) => sum + i.sizeBytes, 0);
   const hasFailed = failed.length > 0;
+  const verb = permanent ? "deleted" : "moved to the Recycle Bin";
 
   const deleteAll = async () => {
     const res = await run(items.map((i) => i.path), false, source, permanent);
-    if (res.failed.length === 0) onDone(freed + res.freedBytes);
+    setStarted(true);
+    // Close straight away only when everything is gone; anything refused or
+    // failed stays on screen with its reason.
+    if (res.failed.length === 0 && res.refused.length === 0) onDone(freed + res.freedBytes, []);
   };
 
   const retryElevated = async () => {
     const res = await run(failed, true, source, permanent);
     setAttempt("elevated");
-    if (res.failed.length === 0) onDone(freed + res.freedBytes);
-    // Otherwise stay open: something is still locked open, which elevation
-    // alone cannot fix — offer Force Delete instead of silently giving up.
+    if (res.failed.length === 0 && res.refused.length === 0 && refused.length === 0) {
+      onDone(freed + res.freedBytes, []);
+    }
   };
 
   const retryForce = async () => {
-    await forceDelete(failed, source, permanent);
-    setAttempt("force");
-    // Stay open regardless of outcome — a scheduled-for-reboot result is
-    // meaningfully different from "freed now" and deserves to be shown
-    // rather than folded silently into a single freed-bytes number.
+    const res = await forceDelete(failed, source, permanent);
+    // Only switch to the result view when the force delete actually ran; if
+    // it could not (e.g. the administrator prompt was declined) the error is
+    // shown and the items stay offered for another try.
+    if (res) setAttempt("force");
   };
 
-  const finish = () => onDone(freed);
+  const finish = () => onDone(freed, [...failed, ...refused.map((r) => r.path)]);
 
   return (
     <Modal
@@ -89,7 +137,7 @@ export function ConfirmDeleteModal({
       onClose={busy ? () => {} : onClose}
       title={title}
       footer={
-        attempt === "force" ? (
+        attempt === "force" || (started && !hasFailed) ? (
           <Button variant="secondary" size="sm" onClick={finish}>
             Done
           </Button>
@@ -134,12 +182,12 @@ export function ConfirmDeleteModal({
         )
       }
     >
-      {attempt === "none" && !hasFailed && (
+      {!started && (
         <>
           <p className="mb-3 text-sm text-muted">
             {permanent
               ? "These items will be permanently deleted — the space is reclaimed immediately, and this cannot be undone."
-              : "Items are moved to the Recycle Bin, so you can restore them if needed."}
+              : "Items are moved to the Recycle Bin, so you can restore them if needed. They keep using disk space until the Recycle Bin is emptied."}
           </p>
           {busy && (
             <div className="mb-3">
@@ -175,18 +223,13 @@ export function ConfirmDeleteModal({
           <div className="mb-3 flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2.5 text-sm text-warning">
             <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
             <span>
-              {failed.length} item(s) could not be deleted — they likely need administrator
-              rights or are in use. {freed > 0 && `Freed ${formatBytes(freed)} so far. `}
-              Retry with administrator to {permanent ? "delete them" : "move them to the Recycle Bin"}.
+              {failed.length} item(s) could not be {verb} — Windows refused. That happens when
+              your account lacks permission for them, or when a program has them open.{" "}
+              {progressNote(freed, permanent)} Retrying as administrator solves the permission
+              case.
             </span>
           </div>
-          <div className="flex flex-col divide-y divide-border">
-            {failed.map((path) => (
-              <div key={path} className="truncate py-1.5 text-xs text-muted">
-                {path}
-              </div>
-            ))}
-          </div>
+          <PathList paths={failed} />
         </>
       )}
 
@@ -195,87 +238,111 @@ export function ConfirmDeleteModal({
           <div className="mb-3 flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2.5 text-sm text-warning">
             <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
             <span>
-              {failed.length} item(s) could not be removed even as administrator — something
-              else has them open. {freed > 0 && `Freed ${formatBytes(freed)} so far. `}
-              Force Delete closes whatever is using them and removes them; if that is still
-              not possible, they are scheduled to be removed automatically the next time you
-              restart your PC.
+              {failed.length} item(s) could not be {verb} even as administrator.{" "}
+              {progressNote(freed, permanent)} Force Delete finds the programs that have them
+              open, closes them (unsaved work in those programs is lost) and tries again.
+              Windows itself, services, virtual machines and system processes are never
+              closed — if one of those holds an item, you are told which one.
             </span>
           </div>
-          <div className="flex flex-col divide-y divide-border">
-            {failed.map((path) => (
-              <div key={path} className="truncate py-1.5 text-xs text-muted">
-                {path}
-              </div>
-            ))}
-          </div>
+          <PathList paths={failed} />
         </>
       )}
 
-      {attempt === "force" && (
+      {started && refused.length > 0 && (
+        <div className="mb-3 flex items-start gap-2 rounded-md border border-danger/40 bg-danger/10 px-3 py-2.5 text-sm text-danger">
+          <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
+          <div className="min-w-0 flex-1">
+            <p>{refused.length} item(s) not deleted — protected:</p>
+            <NoteList notes={refused} />
+          </div>
+        </div>
+      )}
+
+      {started && !hasFailed && attempt !== "force" && (
+        <p className="text-sm text-muted">
+          {freed > 0
+            ? permanent
+              ? `${formatBytes(freed)} deleted.`
+              : `${formatBytes(freed)} moved to the Recycle Bin.`
+            : "Nothing was removed."}
+        </p>
+      )}
+
+      {attempt === "force" && forceResult && (
         <div className="flex flex-col gap-3">
-          {freed > 0 && (
-            <p className="text-sm text-success">Freed {formatBytes(freed)} so far.</p>
+          {forceResult.removed.length > 0 && (
+            <div className="flex items-start gap-2 rounded-md border border-success/40 bg-success/10 px-3 py-2.5 text-sm text-success">
+              <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0" />
+              <div className="min-w-0 flex-1">
+                <p>
+                  {forceResult.removed.length} item(s){" "}
+                  {permanent
+                    ? `deleted (${formatBytes(forceResult.freedBytes)} freed).`
+                    : `removed (${formatBytes(forceResult.freedBytes)}) — sent to the Recycle Bin, or deleted permanently if too large for it. Space in the Recycle Bin is freed when you empty it.`}
+                </p>
+                <PathList paths={forceResult.removed} />
+              </div>
+            </div>
           )}
-          {/* What's actually holding the item open — the honest, actionable
-              result. When present, a restart will not help. */}
-          {blockedBy.length > 0 && (
+
+          {forceResult.closedPrograms.length > 0 && (
+            <div className="rounded-md border border-border px-3 py-2.5 text-sm">
+              <p>Closed to free the items:</p>
+              <ul className="mt-1 list-disc pl-5 text-xs text-muted">
+                {forceResult.closedPrograms.map((p) => (
+                  <li key={p}>{p}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+
+          {forceResult.blocked.length > 0 && (
             <div className="flex items-start gap-2 rounded-md border border-warning/40 bg-warning/10 px-3 py-2.5 text-sm text-warning">
               <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
               <div className="min-w-0 flex-1">
                 <p>
-                  Still in use — these couldn't be closed, so the item can't be removed yet:
+                  {forceResult.blocked.length} item(s) not deleted — still in use by something
+                  this app does not close. Nothing was scheduled for a restart: whatever holds
+                  them would hold them again.
                 </p>
-                <ul className="mt-1 list-disc pl-5 text-foreground">
-                  {blockedBy.map((name) => (
-                    <li key={name}>{name}</li>
-                  ))}
-                </ul>
-                <p className="mt-2 text-xs text-muted">
-                  Close (or quit) the program above, then try again. A restart won't remove it
-                  while that keeps it open — for a virtual machine disk, quit the app that owns
-                  the VM first.
-                </p>
+                <NoteList notes={forceResult.blocked} />
               </div>
             </div>
           )}
-          {blockedBy.length === 0 && scheduledForReboot.length > 0 && (
+
+          {forceResult.scheduledForReboot.length > 0 && (
             <div className="flex items-start gap-2 rounded-md border border-primary/30 bg-primary/10 px-3 py-2.5 text-sm">
               <Clock className="mt-0.5 h-4 w-4 shrink-0 text-primary" />
               <div className="min-w-0 flex-1">
                 <p>
-                  {scheduledForReboot.length} item(s) couldn't be removed now. A removal on the
-                  next <span className="font-medium">full restart</span> was scheduled as a last
-                  resort — but this isn't guaranteed, so check afterward.
+                  {forceResult.scheduledForReboot.length} item(s) not deleted yet. No program
+                  has them open, but Windows refused to delete them now. They are scheduled to
+                  be deleted <span className="font-medium">permanently</span> (not to the
+                  Recycle Bin) during the next restart — use Start ▸ Power ▸ Restart, not Shut
+                  down. If a program creates them again when Windows starts, they will be
+                  back.
                 </p>
-                <div className="mt-2 flex flex-col divide-y divide-border">
-                  {scheduledForReboot.map((path) => (
-                    <div key={path} className="truncate py-1 text-xs text-muted">
-                      {path}
-                    </div>
-                  ))}
-                </div>
+                <PathList paths={forceResult.scheduledForReboot} />
               </div>
             </div>
           )}
-          {failed.length > 0 && blockedBy.length === 0 && (
+
+          {forceResult.failed.length > 0 && (
             <div className="flex items-start gap-2 rounded-md border border-danger/40 bg-danger/10 px-3 py-2.5 text-sm text-danger">
-              <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
+              <XCircle className="mt-0.5 h-4 w-4 shrink-0" />
               <div className="min-w-0 flex-1">
-                <p>{failed.length} item(s) could not be removed — they are still in use.</p>
-                <div className="mt-2 flex flex-col divide-y divide-border">
-                  {failed.map((path) => (
-                    <div key={path} className="truncate py-1 text-xs">
-                      {path}
-                    </div>
-                  ))}
-                </div>
+                <p>{forceResult.failed.length} item(s) not deleted:</p>
+                <NoteList notes={forceResult.failed} />
               </div>
             </div>
           )}
-          {scheduledForReboot.length === 0 && failed.length === 0 && blockedBy.length === 0 && (
-            <p className="text-sm text-success">Everything was removed.</p>
-          )}
+
+          {forceResult.blocked.length === 0 &&
+            forceResult.scheduledForReboot.length === 0 &&
+            forceResult.failed.length === 0 && (
+              <p className="text-sm text-success">All items were removed.</p>
+            )}
         </div>
       )}
 

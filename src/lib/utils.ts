@@ -14,6 +14,19 @@ export function formatBytes(bytes: number): string {
   return `${value >= 100 ? Math.round(value) : value.toFixed(1)} ${UNITS[i]}`;
 }
 
+/** The notice shown after a delete, worded for what actually happened to
+ *  the space: permanently deleted items free it; items in the Recycle Bin
+ *  still use it until the bin is emptied. */
+export function removalNotice(bytes: number, permanent: boolean, notRemoved = 0): string {
+  const main =
+    bytes <= 0
+      ? "No data was removed."
+      : permanent
+        ? `Freed ${formatBytes(bytes)} — permanently deleted.`
+        : `Moved ${formatBytes(bytes)} to the Recycle Bin — empty the Recycle Bin to free the space.`;
+  return notRemoved > 0 ? `${main} ${notRemoved} item(s) were not removed.` : main;
+}
+
 export function formatPercent(part: number, whole: number): string {
   if (whole <= 0) return "0%";
   return `${((part / whole) * 100).toFixed(1)}%`;

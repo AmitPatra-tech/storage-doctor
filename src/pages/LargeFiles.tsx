@@ -3,7 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { EyeOff, FolderOpen, Trash2 } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { refreshAfterCleanup } from "@/lib/refresh";
-import { formatBytes } from "@/lib/utils";
+import { formatBytes, removalNotice } from "@/lib/utils";
 import type { LargeFile } from "@/lib/types";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent } from "@/components/ui/card";
@@ -86,10 +86,10 @@ export function LargeFiles() {
     );
   };
 
-  const afterDelete = (freed: number) => {
+  const afterDelete = (bytes: number, remaining: string[]) => {
     setConfirmOpen(false);
-    setSelected(new Set());
-    setNotice(`Freed ${formatBytes(freed)} — files permanently deleted.`);
+    setSelected(new Set(remaining));
+    setNotice(removalNotice(bytes, true, remaining.length));
     refreshAfterCleanup(queryClient);
   };
 
