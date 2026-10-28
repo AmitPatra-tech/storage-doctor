@@ -835,7 +835,8 @@ pub fn edge_refusal_notes(report_text: &str) -> Vec<String> {
         match kind {
             "done" => completed = true,
             "setup_exit" => notes.push(match a.parse::<i64>() {
-                Ok(0) => "Edge's own uninstaller reported success, but Edge's files are still there.".to_string(),
+                // 19 is Edge's (Chromium installer's) UNINSTALL_SUCCESSFUL.
+                Ok(0) | Ok(19) => "Edge's own uninstaller reported success, but Edge's files are still there.".to_string(),
                 Ok(code) => format!("Edge's own uninstaller refused to remove Edge (exit code {code})."),
                 Err(_) => a.to_string(),
             }),
@@ -1206,8 +1207,7 @@ mod tests {
     #[ignore]
     fn dump_edge_removal_script() {
         let out = std::env::var("SD_EDGE_OUT").expect("SD_EDGE_OUT");
-        std::fs::write(&out, build_edge_removal_script(Path::new(r"C:
-.txt"))).unwrap();
+        std::fs::write(&out, build_edge_removal_script(Path::new("C:/sd-test-report.txt"))).unwrap();
     }
 
     #[test]
@@ -1267,8 +1267,7 @@ mod tests {
             uninstall_string: None,
             display_icon: None,
         };
-        let (script, attempted_edge) = build_force_uninstall_script(&not_edge, Path::new(r"C:
-.txt"));
+        let (script, attempted_edge) = build_force_uninstall_script(&not_edge, Path::new("C:/sd-test-report.txt"));
         assert!(!attempted_edge);
         assert!(!script.contains("--system-level"));
     }
@@ -1332,11 +1331,13 @@ mod tests {
 
         // And the elevated script must only ever stop processes by full path
         // (Where-Object $_.Path -like), never by bare name (Stop-Process -Name).
-        let (script, _) = build_force_uninstall_script(&edge, Path::new(r"C:
-.txt"));
+        let (script, _) = build_force_uninstall_script(&edge, Path::new("C:/sd-test-report.txt"));
         assert!(!script.contains("Stop-Process -Name"));
         assert!(!script.to_lowercase().contains("edgewebview"));
-        assert!(script.contains("$_.Path -like"));
+        // Path-scoped closing is only emitted when Edge is installed here.
+        if !edge_application_dirs().is_empty() {
+            assert!(script.contains("$_.Path -like"));
+        }
     }
 
     /// The Edge removal must: lift the region gate and put it back, run Edge's
@@ -1344,8 +1345,7 @@ mod tests {
     /// being gone — so a Windows-blocked uninstall never half-removes it.
     #[test]
     fn edge_removal_is_region_gated_and_reversible_and_verify_gated() {
-        let script = build_edge_removal_script(Path::new(r"C:
-.txt"));
+        let script = build_edge_removal_script(Path::new("C:/sd-test-report.txt"));
         // Region gate lifted, then restored from the saved value.
         assert!(script.contains(r"Control Panel\International\Geo"));
         assert!(script.contains("Set-ItemProperty -Path $sdGeo -Name Nation -Value '84'"));
@@ -1388,6 +1388,30 @@ mod tests {
         let _ = std::fs::remove_file(&out);
     }
 
+    /// LIVE, DESTRUCTIVE: force-uninstalls Microsoft Edge through the exact
+    /// elevated pipeline the app uses and prints the verified outcome.
+    #[test]
+    #[ignore]
+    fn live_force_uninstall_edge() {
+        let edge = list_installed()
+            .into_iter()
+            .find(|a| is_edge(&a.name))
+            .expect("Microsoft Edge is not listed");
+        println!("TARGET={} {} loc={:?}", edge.name, edge.version, edge.install_location);
+        let report_path = std::env::temp_dir().join("sd_live_edge_report.txt");
+        let (script, attempted) = build_force_uninstall_script(&edge, &report_path);
+        println!("RUN={:?}", crate::commands::run_elevated_powershell(&script, "sd_live_edge.ps1"));
+        let text = std::fs::read_to_string(&report_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&report_path);
+        println!("RAW:\n{text}");
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let report = verify_force_uninstall(&edge, attempted);
+        println!("COMPLETE={} STEPS={:?}", report.complete, report.steps.iter().map(|s| (s.label.clone(), s.ok)).collect::<Vec<_>>());
+        if !report.complete {
+            println!("NOTES={:#?}", edge_refusal_notes(&text));
+        }
+    }
+
     #[test]
     fn edge_refusal_notes_explain_exit_code_failed_steps_and_log() {
         let notes = edge_refusal_notes(
@@ -1401,6 +1425,13 @@ done
 ",
         );
         assert!(notes.iter().any(|n| n.contains("exit code 93")));
+        // 19 = Edge's "uninstall successful": never described as a refusal.
+        let ok19 = edge_refusal_notes("setup_exit	19
+gone	False
+done
+");
+        assert!(ok19.iter().any(|n| n.contains("reported success")));
+        assert!(!ok19.iter().any(|n| n.contains("refused")));
         assert!(notes.iter().any(|n| n.contains("legacy-marker") && n.contains("Access denied")));
         assert!(notes.iter().any(|n| n.contains("Uninstall not allowed")));
         assert!(!notes.iter().any(|n| n.contains("stopped before finishing")));

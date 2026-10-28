@@ -755,8 +755,8 @@ export const backend = {
   async removeStoreApp(name: string): Promise<StoreRemoveResult> {
     if (!isTauri) {
       return name === "Microsoft.GamingApp"
-        ? { removed: false, remainingInstalls: 1, stillProvisioned: false, notes: ["Windows reported: Removal failed. Please contact your software vendor."] }
-        : { removed: true, remainingInstalls: 0, stillProvisioned: false, notes: [] };
+        ? { removed: false, remainingInstalls: 1, stillProvisioned: false, provisionedChecked: true, notes: ["Windows reported: Removal failed. Please contact your software vendor."] }
+        : { removed: true, remainingInstalls: 0, stillProvisioned: false, provisionedChecked: true, notes: [] };
     }
     return invoke("remove_store_app", { name });
   },

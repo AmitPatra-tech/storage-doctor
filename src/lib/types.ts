@@ -268,6 +268,8 @@ export interface StoreRemoveResult {
   remainingInstalls: number;
   /** Windows will still add it to new accounts. */
   stillProvisioned: boolean;
+  /** Whether Windows allowed checking for that copy at all. */
+  provisionedChecked: boolean;
   notes: string[];
 }
 

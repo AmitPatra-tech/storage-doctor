@@ -141,17 +141,23 @@ pub fn valid_package_name(name: &str) -> bool {
 
 /// Elevated script: remove the package for every user, remove its
 /// provisioned copy (so Windows doesn't add it back for new accounts), then
-/// record exactly what is left. Lines: `error\t<msg>`, `left_users\t<n>`,
-/// `left_provisioned\t<n>`, `done`.
+/// record exactly what is left. Every error is tagged with its step, and a
+/// lookup Windows refuses is recorded as unknown — never as "none left".
+/// Lines: `error_remove\t<msg>`, `error_prov\t<msg>`, `left_users\t<n>`,
+/// `left_provisioned\t<n|unknown>`, `done`.
 pub fn build_remove_script(name: &str, report: &Path) -> String {
     let rf = report.to_string_lossy().replace('\'', "''");
     format!(
         r#"$sdOut = New-Object 'System.Collections.Generic.List[string]'
 $n = '{name}'
-try {{ Get-AppxPackage -AllUsers -Name $n | Remove-AppxPackage -AllUsers -ErrorAction Stop }} catch {{ $sdOut.Add("error`t" + $_.Exception.Message) }}
-try {{ Get-AppxProvisionedPackage -Online | Where-Object {{ $_.DisplayName -eq $n }} | Remove-AppxProvisionedPackage -Online -AllUsers -ErrorAction Stop | Out-Null }} catch {{ $sdOut.Add("error`t" + $_.Exception.Message) }}
-$sdOut.Add("left_users`t" + @(Get-AppxPackage -AllUsers -Name $n).Count)
-$sdOut.Add("left_provisioned`t" + @(Get-AppxProvisionedPackage -Online | Where-Object {{ $_.DisplayName -eq $n }}).Count)
+try {{ Get-AppxPackage -AllUsers -Name $n -ErrorAction Stop | Remove-AppxPackage -AllUsers -ErrorAction Stop }} catch {{ $sdOut.Add("error_remove`t" + $_.Exception.Message) }}
+$sdProv = $null
+try {{ $sdProv = @(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object {{ $_.DisplayName -eq $n }}) }} catch {{ $sdOut.Add("error_prov`t" + $_.Exception.Message) }}
+if ($null -ne $sdProv -and $sdProv.Count -gt 0) {{
+  try {{ $sdProv | Remove-AppxProvisionedPackage -Online -AllUsers -ErrorAction Stop | Out-Null }} catch {{ $sdOut.Add("error_prov`t" + $_.Exception.Message) }}
+}}
+try {{ $sdOut.Add("left_users`t" + @(Get-AppxPackage -AllUsers -Name $n -ErrorAction Stop).Count) }} catch {{ $sdOut.Add("left_users`tunknown") }}
+try {{ $sdOut.Add("left_provisioned`t" + @(Get-AppxProvisionedPackage -Online -ErrorAction Stop | Where-Object {{ $_.DisplayName -eq $n }}).Count) }} catch {{ $sdOut.Add("left_provisioned`tunknown") }}
 $sdOut.Add('done')
 try {{ [System.IO.File]::WriteAllLines('{rf}', $sdOut) }} catch {{ }}
 "#
@@ -167,6 +173,8 @@ pub struct StoreRemoveResult {
     pub remaining_installs: u32,
     /// Windows will still add it to new accounts / after feature updates.
     pub still_provisioned: bool,
+    /// Whether Windows let us check for that copy at all.
+    pub provisioned_checked: bool,
     /// Plain-language reasons for anything that did not work.
     pub notes: Vec<String>,
 }
@@ -175,6 +183,8 @@ pub fn parse_remove_report(text: &str) -> StoreRemoveResult {
     let mut r = StoreRemoveResult::default();
     let mut completed = false;
     let mut users: Option<u32> = None;
+    let mut remove_err: Option<String> = None;
+    let mut prov_err: Option<String> = None;
     for line in text.lines() {
         let mut parts = line.splitn(2, '\t');
         let kind = parts.next().unwrap_or("").trim_start_matches('\u{feff}');
@@ -182,17 +192,15 @@ pub fn parse_remove_report(text: &str) -> StoreRemoveResult {
         match kind {
             "done" => completed = true,
             "left_users" => users = val.parse().ok(),
-            "left_provisioned" => r.still_provisioned = val.parse::<u32>().unwrap_or(0) > 0,
-            "error" if !val.is_empty() => {
-                let msg = if val.contains("0x80073CFA") {
-                    "Windows marks this app as part of the system and refused to remove it.".to_string()
-                } else {
-                    format!("Windows reported: {val}")
-                };
-                if !r.notes.contains(&msg) {
-                    r.notes.push(msg);
+            "left_provisioned" => match val.parse::<u32>() {
+                Ok(n) => {
+                    r.provisioned_checked = true;
+                    r.still_provisioned = n > 0;
                 }
-            }
+                Err(_) => r.provisioned_checked = false,
+            },
+            "error_remove" if !val.is_empty() => remove_err = Some(val.to_string()),
+            "error_prov" if !val.is_empty() => prov_err = Some(val.to_string()),
             _ => {}
         }
     }
@@ -201,12 +209,31 @@ pub fn parse_remove_report(text: &str) -> StoreRemoveResult {
     }
     r.remaining_installs = users.unwrap_or(1);
     r.removed = completed && users == Some(0);
-    if r.removed && r.still_provisioned {
-        r.notes.push(
-            "Removed for every account, but Windows still keeps a copy to install for new \
-             accounts."
-                .into(),
-        );
+    // A step's error is only worth showing when that step's goal was not met.
+    if !r.removed {
+        if let Some(e) = remove_err {
+            r.notes.push(if e.contains("0x80073CFA") {
+                "Windows marks this app as part of the system and refused to remove it.".to_string()
+            } else {
+                format!("Windows reported: {e}")
+            });
+        }
+    }
+    if r.removed {
+        if !r.provisioned_checked {
+            r.notes.push(format!(
+                "Removed for every account. Windows did not allow checking whether it keeps a \
+                 copy to install for new accounts{}, so the app could come back for a new \
+                 account or after a major Windows update.",
+                prov_err.map(|e| format!(" (\"{e}\")")).unwrap_or_default()
+            ));
+        } else if r.still_provisioned {
+            r.notes.push(
+                "Removed for every account, but Windows still keeps a copy to install for new \
+                 accounts."
+                    .into(),
+            );
+        }
     }
     r
 }
@@ -214,6 +241,22 @@ pub fn parse_remove_report(text: &str) -> StoreRemoveResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// LIVE, DESTRUCTIVE: removes the package named in SD_LIVE_PKG through
+    /// the exact pipeline the app uses, then prints the classified result.
+    #[test]
+    #[ignore]
+    fn live_remove() {
+        let name = std::env::var("SD_LIVE_PKG").expect("SD_LIVE_PKG");
+        assert!(valid_package_name(&name));
+        let report = std::env::temp_dir().join("sd_live_store_remove.txt");
+        let script = build_remove_script(&name, &report);
+        println!("RUN={:?}", crate::commands::run_elevated_powershell(&script, "sd_live_store.ps1"));
+        let text = std::fs::read_to_string(&report).unwrap_or_default();
+        let _ = std::fs::remove_file(&report);
+        println!("RAW:\n{text}");
+        println!("RESULT={:?}", parse_remove_report(&text));
+    }
 
     /// LIVE, read-only: lists the real Store/built-in apps.
     #[test]
@@ -247,14 +290,24 @@ mod tests {
     #[test]
     fn remove_report_is_classified_exactly() {
         let ok = parse_remove_report("left_users\t0\nleft_provisioned\t0\ndone\n");
-        assert!(ok.removed && !ok.still_provisioned && ok.notes.is_empty());
+        assert!(ok.removed && !ok.still_provisioned && ok.provisioned_checked && ok.notes.is_empty());
+
+        // The real case on this PC: removed for everyone, but Windows denied the
+        // provisioned lookup. Must say "couldn't check", never "no copy left",
+        // and the irrelevant step error must not read as a failure.
+        let denied = parse_remove_report(
+            "error_prov\tAccess is denied.\nleft_users\t0\nleft_provisioned\tunknown\ndone\n",
+        );
+        assert!(denied.removed && !denied.provisioned_checked);
+        assert!(denied.notes.iter().any(|n| n.contains("did not allow checking")));
+        assert!(!denied.notes.iter().any(|n| n.starts_with("Windows reported")));
 
         let prov = parse_remove_report("left_users\t0\nleft_provisioned\t1\ndone\n");
         assert!(prov.removed && prov.still_provisioned);
         assert!(prov.notes.iter().any(|n| n.contains("new accounts")));
 
         let sys = parse_remove_report(
-            "error\tRemoval failed. 0x80073CFA, Removal failed. Please contact your software vendor.\nleft_users\t1\nleft_provisioned\t0\ndone\n",
+            "error_remove\tRemoval failed. 0x80073CFA, Removal failed. Please contact your software vendor.\nleft_users\t1\nleft_provisioned\t0\ndone\n",
         );
         assert!(!sys.removed);
         assert_eq!(sys.remaining_installs, 1);
