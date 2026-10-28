@@ -499,10 +499,15 @@ pub struct ForceStep {
 #[serde(rename_all = "camelCase")]
 pub struct ForceUninstallReport {
     pub steps: Vec<ForceStep>,
-    /// No matching registry entry and (if it had one) no install folder left
-    /// — the practical definition of "actually uninstalled now". Leftover
-    /// data and shortcuts are cleaned up too but do not gate this.
+    /// Actually uninstalled now: no registry entry and no install folder left
+    /// (for Edge: the browser's files are gone). Leftover data and shortcuts
+    /// are cleaned up too but do not gate this.
     pub complete: bool,
+    /// The registry entry is gone, but Windows never recorded where the
+    /// program's files are, so their removal can't be confirmed.
+    pub files_unknown: bool,
+    /// Plain-language explanations of anything that did not work.
+    pub notes: Vec<String>,
 }
 
 /// A background helper worth stopping that a plain install-folder match would
@@ -795,30 +800,6 @@ fn newest_edge_setup(app_dir: &Path) -> Option<PathBuf> {
     best.map(|(_, path)| path)
 }
 
-/// Locates Microsoft Edge's own uninstaller. Edge does not remove itself
-/// through a plain `UninstallString` — it insists on `setup.exe --uninstall`,
-/// run from inside its own versioned application folder, which is exactly
-/// why "the uninstaller won't run" is the standard complaint about Edge.
-/// Checked machine-wide first (the common case for Edge), then per-user.
-/// Returns whether the install found is machine-wide (needs administrator
-/// rights to remove).
-fn edge_setup_exe() -> Option<(PathBuf, bool)> {
-    for base in [env_path("ProgramFiles(x86)"), env_path("ProgramFiles")]
-        .into_iter()
-        .flatten()
-    {
-        if let Some(setup) = newest_edge_setup(&base.join(r"Microsoft\Edge\Application")) {
-            return Some((setup, true));
-        }
-    }
-    if let Some(base) = env_path("LOCALAPPDATA") {
-        if let Some(setup) = newest_edge_setup(&base.join(r"Microsoft\Edge\Application")) {
-            return Some((setup, false));
-        }
-    }
-    None
-}
-
 /// Sends a file or folder to the Recycle Bin — a forced uninstall is still
 /// not a reason to make a mistake unrecoverable, matching how every other
 /// deletion in this app behaves.
@@ -830,23 +811,86 @@ fn trash_path(path: &Path) {
 /// trusting what a removal attempt claimed to do. `attempted_edge` controls
 /// whether the Edge-specific step is shown at all (only relevant when this
 /// pass actually tried it).
+/// Whether Microsoft Edge (the browser — not the WebView2 Runtime) is still
+/// installed: any msedge.exe left in a machine-wide or per-user Edge folder.
+pub fn edge_installed() -> bool {
+    [env_path("ProgramFiles(x86)"), env_path("ProgramFiles"), env_path("LOCALAPPDATA")]
+        .into_iter()
+        .flatten()
+        .map(|b| b.join(r"Microsoft\Edge\Application"))
+        .any(|dir| dir.join("msedge.exe").exists() || newest_edge_setup(&dir).is_some())
+}
+
+/// Turns the Edge removal script's report into plain sentences explaining
+/// why Edge is still installed.
+pub fn edge_refusal_notes(report_text: &str) -> Vec<String> {
+    let mut notes = Vec::new();
+    let mut log = Vec::new();
+    let mut completed = false;
+    for line in report_text.lines() {
+        let mut parts = line.splitn(3, '\t');
+        let kind = parts.next().unwrap_or("").trim_start_matches('\u{feff}');
+        let a = parts.next().unwrap_or("");
+        let b = parts.next().unwrap_or("");
+        match kind {
+            "done" => completed = true,
+            "setup_exit" => notes.push(match a.parse::<i64>() {
+                Ok(0) => "Edge's own uninstaller reported success, but Edge's files are still there.".to_string(),
+                Ok(code) => format!("Edge's own uninstaller refused to remove Edge (exit code {code})."),
+                Err(_) => a.to_string(),
+            }),
+            "step" if b.starts_with("failed") => {
+                notes.push(format!("Could not prepare the uninstall ({a}): {b}."))
+            }
+            "log" if !a.trim().is_empty() => log.push(a.trim().to_string()),
+            _ => {}
+        }
+    }
+    if !completed {
+        notes.push("The administrator step stopped before finishing.".into());
+    }
+    if !log.is_empty() {
+        let tail: Vec<String> = log.iter().rev().take(4).rev().cloned().collect();
+        notes.push(format!("Edge's uninstaller log ends with:\n{}", tail.join("\n")));
+    }
+    notes
+}
+
 pub fn verify_force_uninstall(app: &InstalledApp, attempted_edge: bool) -> ForceUninstallReport {
     let mut steps = vec![ForceStep {
         label: "Closed running processes".into(),
         ok: !any_related_process_running(app),
     }];
-    if attempted_edge {
+    let registry_gone = find_uninstall_key_paths(&app.name).is_empty();
+
+    if is_edge(&app.name) {
+        // Edge is judged only by whether the browser itself is gone. Its
+        // registry entry alone proves nothing: earlier versions of this app
+        // could remove the entry while every Edge file stayed in place.
+        let edge_gone = !edge_installed();
+        if attempted_edge {
+            steps.push(ForceStep {
+                label: "Microsoft Edge's own uninstaller removed Edge".into(),
+                ok: edge_gone,
+            });
+        }
         steps.push(ForceStep {
-            label: "Ran Microsoft Edge's own uninstaller".into(),
-            ok: edge_setup_exe().is_none(),
+            label: "Removed it from Installed Apps".into(),
+            ok: registry_gone,
         });
+        return ForceUninstallReport {
+            steps,
+            complete: edge_gone,
+            files_unknown: false,
+            notes: Vec::new(),
+        };
     }
+
     let remaining = remaining_paths(app);
     steps.push(ForceStep {
         label: "Removed the program's files".into(),
         ok: remaining.is_empty(),
     });
-    let registry_gone = find_uninstall_key_paths(&app.name).is_empty();
     steps.push(ForceStep {
         label: "Removed it from Installed Apps".into(),
         ok: registry_gone,
@@ -859,11 +903,21 @@ pub fn verify_force_uninstall(app: &InstalledApp, attempted_edge: bool) -> Force
     // Completeness is gated only on directories we would actually remove. A
     // protected/too-broad install location is never a delete target, so its
     // continued existence must not make a genuine removal read as incomplete.
-    let install_dir_gone = destructive_install_dir(app)
-        .map(|p| !p.exists())
-        .unwrap_or(true);
+    let install_dir = destructive_install_dir(app);
+    let install_dir_gone = install_dir.as_ref().map(|p| !p.exists()).unwrap_or(true);
+    // Windows didn't record where this program's files are (or recorded a
+    // location too broad to delete): the files can't be confirmed gone.
+    let files_unknown = install_dir.is_none();
+    let mut notes = Vec::new();
+    if files_unknown && registry_gone {
+        notes.push(
+            "Windows doesn't record where this program's files are, so Storage Doctor can't \
+             confirm they were removed. Use \"Find leftovers\" to look for them."
+                .into(),
+        );
+    }
     let complete = registry_gone && install_dir_gone;
-    ForceUninstallReport { steps, complete }
+    ForceUninstallReport { steps, complete, files_unknown, notes }
 }
 
 /// Best-effort force removal without administrator rights: stops related
@@ -923,9 +977,9 @@ fn recycle_item_script(path: &Path) -> String {
 /// Returns the script together with whether it attempts the Edge step, so
 /// the caller's step report can match. Pure — runs no privileged code
 /// itself; `commands::run_elevated_powershell` executes what this builds.
-pub fn build_force_uninstall_script(app: &InstalledApp) -> (String, bool) {
+pub fn build_force_uninstall_script(app: &InstalledApp, report: &Path) -> (String, bool) {
     if is_edge(&app.name) {
-        return (build_edge_removal_script(), true);
+        return (build_edge_removal_script(report), true);
     }
 
     // Includes the SDForceDelete helper so the shared robust-remove routine
@@ -1011,7 +1065,7 @@ fn edge_application_dirs() -> Vec<PathBuf> {
 /// Only ever touches `Microsoft\Edge` and `Microsoft\EdgeUpdate`. The shared
 /// WebView2 Runtime (`Microsoft\EdgeWebView`), which this app and others
 /// render with, is never touched.
-fn build_edge_removal_script() -> String {
+fn build_edge_removal_script(report: &Path) -> String {
     let ps_list = |dirs: &[PathBuf]| {
         dirs.iter()
             .map(|d| format!("'{}'", d.to_string_lossy().replace('\'', "''")))
@@ -1022,18 +1076,11 @@ fn build_edge_removal_script() -> String {
     let setups: Vec<PathBuf> = app_dirs.iter().filter_map(|d| newest_edge_setup(d)).collect();
 
     let mut s = String::from("Add-Type -AssemblyName Microsoft.VisualBasic\n");
+    s.push_str("$sdOut = New-Object 'System.Collections.Generic.List[string]'\n");
 
-    // 1. Close Edge and its updater (path-scoped — never the WebView2 runtime).
-    for dir in app_dirs.iter().chain(
-        [
-            env_path("ProgramFiles(x86)").map(|p| p.join(r"Microsoft\EdgeUpdate")),
-            env_path("ProgramFiles").map(|p| p.join(r"Microsoft\EdgeUpdate")),
-        ]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>()
-        .iter(),
-    ) {
+    // 1. Close Edge (path-scoped — never the WebView2 runtime or EdgeUpdate,
+    //    which WebView2 needs to stay up to date).
+    for dir in &app_dirs {
         let esc = dir.to_string_lossy().replace('\'', "''");
         s.push_str(&format!(
             "Get-Process | Where-Object {{ $_.Path -like '{esc}\\*' }} | Stop-Process -Force -ErrorAction SilentlyContinue\n"
@@ -1041,70 +1088,48 @@ fn build_edge_removal_script() -> String {
     }
     s.push_str("Start-Sleep -Milliseconds 500\n");
 
-    // 2. Lift the region gate: save the current region, set an EEA one.
-    s.push_str(
-        "$sdGeo = 'HKCU:\\Control Panel\\International\\Geo'\n\
-         $sdNation = (Get-ItemProperty -Path $sdGeo -Name Nation -ErrorAction SilentlyContinue).Nation\n\
-         try { Set-ItemProperty -Path $sdGeo -Name Nation -Value '84' -ErrorAction SilentlyContinue } catch { }\n",
-    );
+    // 2. Edge's own uninstaller refuses unless uninstalling is allowed. Allow
+    //    it the ways it checks for, temporarily, recording each step: the
+    //    EdgeUpdateDev\AllowUninstall flag, the legacy-Edge marker file, and
+    //    an EEA region.
+    s.push_str(EDGE_ALLOW_STEPS);
 
-    // 3. Run Edge's own uninstaller (this is the clean removal when permitted).
+    // 3. Run Edge's own uninstaller, recording its exit code.
     for setup in &setups {
         let esc = setup.to_string_lossy().replace('\'', "''");
         s.push_str(&format!(
-            "try {{ Start-Process -FilePath '{esc}' \
-             -ArgumentList '--uninstall','--system-level','--verbose-logging','--force-uninstall' \
-             -Wait -ErrorAction SilentlyContinue }} catch {{ }}\n"
-        ));
-        s.push_str(&format!(
-            "try {{ Start-Process -FilePath '{esc}' \
-             -ArgumentList '--uninstall','--verbose-logging','--force-uninstall' \
-             -Wait -ErrorAction SilentlyContinue }} catch {{ }}\n"
+            "try {{ $sdP = Start-Process -FilePath '{esc}' -ArgumentList '--uninstall','--system-level','--verbose-logging','--force-uninstall' -Wait -PassThru -ErrorAction Stop; $sdOut.Add(\"setup_exit`t\" + $sdP.ExitCode) }} catch {{ $sdOut.Add(\"setup_exit`tdid not start: \" + $_.Exception.Message) }}\n"
         ));
     }
+    if setups.is_empty() {
+        s.push_str("$sdOut.Add(\"setup_exit`tEdge's uninstaller (setup.exe) was not found\")\n");
+    }
 
-    // 4. Restore the original region immediately, whatever happened.
-    s.push_str(
-        "if ($null -ne $sdNation) { try { Set-ItemProperty -Path $sdGeo -Name Nation -Value $sdNation -ErrorAction SilentlyContinue } catch { } }\n",
-    );
+    // 4. Undo every temporary change, whatever happened.
+    s.push_str(EDGE_UNDO_STEPS);
 
-    // 5. Decide success by what is on disk, not by the uninstaller's exit code:
-    //    is there still an msedge.exe under any Edge\Application dir?
+    // 5. Success is decided by what is on disk: is msedge.exe still there?
     s.push_str(&format!(
         "$sdEdgeDirs = @({})\n\
          $sdGone = $true\n\
-         foreach ($d in $sdEdgeDirs) {{ if (Get-ChildItem -LiteralPath $d -Recurse -Filter msedge.exe -ErrorAction SilentlyContinue | Select-Object -First 1) {{ $sdGone = $false }} }}\n",
+         foreach ($d in $sdEdgeDirs) {{ if (Get-ChildItem -LiteralPath $d -Recurse -Filter msedge.exe -ErrorAction SilentlyContinue | Select-Object -First 1) {{ $sdGone = $false }} }}\n\
+         $sdOut.Add(\"gone`t\" + $sdGone)\n",
         ps_list(&app_dirs)
     ));
 
-    // 6. Only if Edge is genuinely gone: remove what it leaves behind and the
-    //    update services/tasks that would otherwise reinstall it. Gated so a
-    //    blocked uninstall never half-removes Edge.
-    let leftovers: Vec<PathBuf> = edge_application_dirs()
-        .iter()
-        .filter_map(|d| d.parent().map(|p| p.to_path_buf())) // ...\Microsoft\Edge
-        .collect();
+    // 6. Only once Edge is gone: remove its leftovers and its Store stub
+    //    package, and block EdgeUpdate from installing Edge again (the official
+    //    "Install (Microsoft Edge)" = disabled policy). EdgeUpdate itself stays:
+    //    it keeps the WebView2 Runtime updated.
     let mut cleanup = String::new();
-    // Edge install roots (…\Microsoft\Edge) and the updater dir.
-    for dir in leftovers.iter().cloned().chain(
-        [
-            env_path("ProgramFiles(x86)").map(|p| p.join(r"Microsoft\EdgeUpdate")),
-            env_path("ProgramFiles").map(|p| p.join(r"Microsoft\EdgeUpdate")),
-            env_path("ProgramData").map(|p| p.join(r"Microsoft\EdgeUpdate")),
-            env_path("LOCALAPPDATA").map(|p| p.join(r"Microsoft\Edge")),
-        ]
-        .into_iter()
-        .flatten(),
-    ) {
+    for dir in app_dirs
+        .iter()
+        .filter_map(|d| d.parent().map(|p| p.to_path_buf())) // …\Microsoft\Edge
+        .chain(env_path("LOCALAPPDATA").map(|p| p.join(r"Microsoft\Edge")))
+    {
         cleanup.push_str(&recycle_item_script(&dir));
     }
-    // Stop and delete the EdgeUpdate services, and its scheduled tasks, so it
-    // cannot silently reinstall Edge.
-    cleanup.push_str(
-        "foreach ($svc in 'edgeupdate','edgeupdatem') { try { Stop-Service $svc -Force -ErrorAction SilentlyContinue; & sc.exe delete $svc | Out-Null } catch { } }\n\
-         try { Get-ScheduledTask -TaskName 'MicrosoftEdgeUpdate*' -ErrorAction SilentlyContinue | Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue } catch { }\n",
-    );
-    // Remove the registry Uninstall entries for Edge.
+    cleanup.push_str(EDGE_AFTER_REMOVAL_STEPS);
     for (hive, path) in find_uninstall_key_paths("Microsoft Edge") {
         let root = match hive {
             "HKLM" => "HKEY_LOCAL_MACHINE",
@@ -1118,14 +1143,56 @@ fn build_edge_removal_script() -> String {
     for shortcut in find_shortcuts("Microsoft Edge", "Microsoft Corporation") {
         cleanup.push_str(&recycle_item_script(&shortcut));
     }
-
-    // Indent the cleanup under the `if ($sdGone)` guard.
     s.push_str("if ($sdGone) {\n");
     s.push_str(&cleanup);
     s.push_str("}\n");
 
+    // 7. Edge's uninstaller writes its reason to msedge_installer.log; keep
+    //    the end of it so a refusal can be shown as-is.
+    s.push_str(EDGE_LOG_STEPS);
+
+    let rf = report.to_string_lossy().replace('\'', "''");
+    s.push_str(&format!(
+        "$sdOut.Add('done')\ntry {{ [System.IO.File]::WriteAllLines('{rf}', $sdOut) }} catch {{ }}\n"
+    ));
     s
 }
+
+const EDGE_ALLOW_STEPS: &str = r#"
+$sdDev = 'HKLM:\SOFTWARE\WOW6432Node\Microsoft\EdgeUpdateDev'
+$sdHadDev = Test-Path $sdDev
+try { New-Item -Path $sdDev -Force -ErrorAction Stop | Out-Null; New-ItemProperty -Path $sdDev -Name AllowUninstall -Value '' -PropertyType String -Force -ErrorAction Stop | Out-Null; $sdOut.Add("step`tallow-flag`tset") } catch { $sdOut.Add("step`tallow-flag`tfailed: " + $_.Exception.Message) }
+$sdLegacyDir = Join-Path $env:SystemRoot 'SystemApps\Microsoft.MicrosoftEdge_8wekyb3d8bbwe'
+$sdLegacy = Join-Path $sdLegacyDir 'MicrosoftEdge.exe'
+$sdMadeDir = $false; $sdMadeFile = $false
+try {
+  if (-not (Test-Path -LiteralPath $sdLegacyDir)) { New-Item -ItemType Directory -Path $sdLegacyDir -Force -ErrorAction Stop | Out-Null; $sdMadeDir = $true }
+  if (-not (Test-Path -LiteralPath $sdLegacy)) { New-Item -ItemType File -Path $sdLegacy -Force -ErrorAction Stop | Out-Null; $sdMadeFile = $true }
+  $sdOut.Add("step`tlegacy-marker`tset")
+} catch { $sdOut.Add("step`tlegacy-marker`tfailed: " + $_.Exception.Message) }
+$sdGeo = 'HKCU:\Control Panel\International\Geo'
+$sdNation = (Get-ItemProperty -Path $sdGeo -Name Nation -ErrorAction SilentlyContinue).Nation
+try { Set-ItemProperty -Path $sdGeo -Name Nation -Value '84' -ErrorAction Stop; $sdOut.Add("step`tregion`tset") } catch { $sdOut.Add("step`tregion`tfailed") }
+"#;
+
+const EDGE_UNDO_STEPS: &str = r#"
+if ($null -ne $sdNation) { try { Set-ItemProperty -Path $sdGeo -Name Nation -Value $sdNation -ErrorAction SilentlyContinue } catch { } }
+if ($sdMadeFile) { Remove-Item -LiteralPath $sdLegacy -Force -ErrorAction SilentlyContinue }
+if ($sdMadeDir) { Remove-Item -LiteralPath $sdLegacyDir -Force -ErrorAction SilentlyContinue }
+try { Remove-ItemProperty -Path $sdDev -Name AllowUninstall -ErrorAction SilentlyContinue } catch { }
+if (-not $sdHadDev) { Remove-Item -Path $sdDev -Force -ErrorAction SilentlyContinue }
+"#;
+
+const EDGE_AFTER_REMOVAL_STEPS: &str = r#"
+try { Get-AppxPackage -AllUsers -Name 'Microsoft.MicrosoftEdge.Stable' -ErrorAction SilentlyContinue | Remove-AppxPackage -AllUsers -ErrorAction SilentlyContinue } catch { }
+try { $sdPol = 'HKLM:\SOFTWARE\Policies\Microsoft\EdgeUpdate'; New-Item -Path $sdPol -Force | Out-Null; New-ItemProperty -Path $sdPol -Name 'Install{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}' -Value 0 -PropertyType DWord -Force | Out-Null; $sdOut.Add("step`treinstall-block`tset") } catch { $sdOut.Add("step`treinstall-block`tfailed") }
+"#;
+
+const EDGE_LOG_STEPS: &str = r#"
+foreach ($sdLog in @((Join-Path $env:TEMP 'msedge_installer.log'), (Join-Path $env:SystemRoot 'SystemTemp\msedge_installer.log'), (Join-Path $env:SystemRoot 'Temp\msedge_installer.log'))) {
+  if (Test-Path -LiteralPath $sdLog) { foreach ($l in (Get-Content -LiteralPath $sdLog -Tail 12 -ErrorAction SilentlyContinue)) { $sdOut.Add("log`t" + $l) }; break }
+}
+"#;
 
 #[cfg(test)]
 mod tests {
@@ -1139,7 +1206,8 @@ mod tests {
     #[ignore]
     fn dump_edge_removal_script() {
         let out = std::env::var("SD_EDGE_OUT").expect("SD_EDGE_OUT");
-        std::fs::write(&out, build_edge_removal_script()).unwrap();
+        std::fs::write(&out, build_edge_removal_script(Path::new(r"C:
+.txt"))).unwrap();
     }
 
     #[test]
@@ -1199,7 +1267,8 @@ mod tests {
             uninstall_string: None,
             display_icon: None,
         };
-        let (script, attempted_edge) = build_force_uninstall_script(&not_edge);
+        let (script, attempted_edge) = build_force_uninstall_script(&not_edge, Path::new(r"C:
+.txt"));
         assert!(!attempted_edge);
         assert!(!script.contains("--system-level"));
     }
@@ -1263,7 +1332,8 @@ mod tests {
 
         // And the elevated script must only ever stop processes by full path
         // (Where-Object $_.Path -like), never by bare name (Stop-Process -Name).
-        let (script, _) = build_force_uninstall_script(&edge);
+        let (script, _) = build_force_uninstall_script(&edge, Path::new(r"C:
+.txt"));
         assert!(!script.contains("Stop-Process -Name"));
         assert!(!script.to_lowercase().contains("edgewebview"));
         assert!(script.contains("$_.Path -like"));
@@ -1274,7 +1344,8 @@ mod tests {
     /// being gone — so a Windows-blocked uninstall never half-removes it.
     #[test]
     fn edge_removal_is_region_gated_and_reversible_and_verify_gated() {
-        let script = build_edge_removal_script();
+        let script = build_edge_removal_script(Path::new(r"C:
+.txt"));
         // Region gate lifted, then restored from the saved value.
         assert!(script.contains(r"Control Panel\International\Geo"));
         assert!(script.contains("Set-ItemProperty -Path $sdGeo -Name Nation -Value '84'"));
@@ -1283,12 +1354,58 @@ mod tests {
         assert!(script.contains("msedge.exe"));
         assert!(script.contains("if ($sdGone) {"));
         let gone_pos = script.find("if ($sdGone) {").unwrap();
-        // The update-service teardown (a destructive, hard-to-undo step) must
-        // sit inside the verified-gone guard, never before it.
-        let svc_pos = script.find("sc.exe delete").unwrap();
-        assert!(svc_pos > gone_pos, "service removal must be gated on Edge being gone");
+        // EdgeUpdate is never torn down: it keeps the WebView2 Runtime updated.
+        assert!(!script.contains("sc.exe delete"));
+        assert!(!script.contains("Unregister-ScheduledTask"));
+        // Reinstall is blocked by the official policy, only once Edge is gone.
+        let block = script.find("Install{56EB18F8-B008-4CBD-B6D2-8C97FE7E9062}").unwrap();
+        assert!(block > gone_pos, "reinstall block must be gated on Edge being gone");
+        // Every temporary change is undone, and the uninstaller's exit code
+        // and log are recorded for an honest report.
+        assert!(script.contains("Remove-ItemProperty -Path $sdDev -Name AllowUninstall"));
+        assert!(script.contains("if ($sdMadeFile) { Remove-Item -LiteralPath $sdLegacy"));
+        assert!(script.contains("setup_exit"));
+        assert!(script.contains("msedge_installer.log"));
+        assert!(script.contains("$sdOut.Add('done')"));
         // Never the shared WebView2 runtime.
         assert!(!script.to_lowercase().contains("edgewebview"));
+    }
+
+    /// LIVE, elevated, NON-destructive: runs only Edge's temporary "allow
+    /// uninstall" preparation and its undo (never the uninstaller), then
+    /// prints the recorded steps so the system can be checked afterwards.
+    #[test]
+    #[ignore]
+    fn live_edge_prepare_and_undo_only() {
+        let out = std::env::temp_dir().join("sd_edge_prep_report.txt");
+        let rf = out.to_string_lossy().replace('\'', "''");
+        let during = "$sdOut.Add('during`tmarker=' + (Test-Path -LiteralPath $sdLegacy) + ' flag=' + [bool](Get-ItemProperty -Path $sdDev -Name AllowUninstall -ErrorAction SilentlyContinue) + ' nation=' + (Get-ItemProperty -Path $sdGeo -Name Nation).Nation)";
+        let script = format!(
+            "$sdOut = New-Object 'System.Collections.Generic.List[string]'\n{EDGE_ALLOW_STEPS}\n{during}\n{EDGE_UNDO_STEPS}\n$sdOut.Add('done')\n[System.IO.File]::WriteAllLines('{rf}', $sdOut)\n"
+        );
+        println!("RUN={:?}", crate::commands::run_elevated_powershell(&script, "sd_edge_prep.ps1"));
+        println!("{}", std::fs::read_to_string(&out).unwrap_or_default());
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn edge_refusal_notes_explain_exit_code_failed_steps_and_log() {
+        let notes = edge_refusal_notes(
+            "step	allow-flag	set
+step	legacy-marker	failed: Access denied
+setup_exit	93
+gone	False
+log	line a
+log	Uninstall not allowed
+done
+",
+        );
+        assert!(notes.iter().any(|n| n.contains("exit code 93")));
+        assert!(notes.iter().any(|n| n.contains("legacy-marker") && n.contains("Access denied")));
+        assert!(notes.iter().any(|n| n.contains("Uninstall not allowed")));
+        assert!(!notes.iter().any(|n| n.contains("stopped before finishing")));
+        // No report at all (prompt declined / script crashed) is said plainly.
+        assert!(edge_refusal_notes("").iter().any(|n| n.contains("stopped before finishing")));
     }
 
     // Shapes taken verbatim from real registry UninstallString values.

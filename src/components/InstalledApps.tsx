@@ -31,6 +31,8 @@ function UninstallPanel({ app, onClose }: { app: InstalledApp; onClose: () => vo
   const [error, setError] = useState<string | null>(null);
   const [forcing, setForcing] = useState(false);
   const [forceReport, setForceReport] = useState<ForceUninstallReport | null>(null);
+  /** The administrator pass has already run for this app. */
+  const [elevatedTried, setElevatedTried] = useState(false);
   const [forceError, setForceError] = useState<string | null>(null);
 
   const launch = async () => {
@@ -111,6 +113,7 @@ function UninstallPanel({ app, onClose }: { app: InstalledApp; onClose: () => vo
         ? await backend.forceUninstallElevated(app)
         : await backend.forceUninstall(app);
       setForceReport(report);
+      if (elevated) setElevatedTried(true);
       if (report.complete) {
         queryClient.invalidateQueries({ queryKey: ["installedApps"] });
         refreshAfterCleanup(queryClient);
@@ -248,10 +251,24 @@ function UninstallPanel({ app, onClose }: { app: InstalledApp; onClose: () => vo
                 <span className={step.ok ? "text-muted" : "text-foreground"}>{step.label}</span>
               </div>
             ))}
+            {forceReport.notes.length > 0 && (
+              <ul className="mt-1 flex flex-col gap-1 text-xs text-muted">
+                {forceReport.notes.map((n) => (
+                  <li key={n} className="whitespace-pre-line">
+                    {n}
+                  </li>
+                ))}
+              </ul>
+            )}
             {forceReport.complete ? (
               <p className="mt-1 text-xs text-success">
-                Removed. Files went to the Recycle Bin; its entry in Installed Apps cannot
-                be undone.
+                {forceReport.filesUnknown
+                  ? "Removed from Installed Apps and its shortcuts. Its program files could not be confirmed as removed (see above)."
+                  : "Removed. Files went to the Recycle Bin; its entry in Installed Apps cannot be undone."}
+              </p>
+            ) : elevatedTried ? (
+              <p className="mt-1 text-xs text-danger">
+                Still installed, even with administrator rights. The reasons are listed above.
               </p>
             ) : (
               <div className="mt-1 flex items-center gap-3">
@@ -262,10 +279,10 @@ function UninstallPanel({ app, onClose }: { app: InstalledApp; onClose: () => vo
                   onClick={() => runForce(true)}
                 >
                   <ShieldAlert className="h-3.5 w-3.5" />
-                  {forcing ? "Requesting admin…" : "Finish with Administrator Rights"}
+                  {forcing ? "Working…" : "Finish with Administrator Rights"}
                 </Button>
                 <span className="text-xs text-muted">
-                  Some of it needs administrator rights to remove.
+                  The rest needs administrator rights to remove.
                 </span>
               </div>
             )}

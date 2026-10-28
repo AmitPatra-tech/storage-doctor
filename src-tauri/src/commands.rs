@@ -824,13 +824,21 @@ pub async fn force_uninstall_elevated(
     target: uninstall::InstalledApp,
 ) -> Result<uninstall::ForceUninstallReport, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let (script, attempted_edge) = uninstall::build_force_uninstall_script(&target);
+        let report_path = new_force_report_path();
+        let (script, attempted_edge) =
+            uninstall::build_force_uninstall_script(&target, &report_path);
         run_elevated_powershell(&script, "storage_doctor_force_uninstall.ps1")?;
+        let report_text = std::fs::read_to_string(&report_path).unwrap_or_default();
+        let _ = std::fs::remove_file(&report_path);
         // Edge's own uninstaller keeps tearing down scheduled tasks briefly
         // after setup.exe returns; give it a moment before checking whether
         // it is really gone.
         std::thread::sleep(std::time::Duration::from_secs(1));
-        Ok(uninstall::verify_force_uninstall(&target, attempted_edge))
+        let mut report = uninstall::verify_force_uninstall(&target, attempted_edge);
+        if attempted_edge && !report.complete {
+            report.notes = uninstall::edge_refusal_notes(&report_text);
+        }
+        Ok(report)
     })
     .await
     .map_err(|e| e.to_string())?

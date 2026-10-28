@@ -438,6 +438,8 @@ export const backend = {
           { label: "Removed shortcuts", ok: true },
         ],
         complete: false,
+        filesUnknown: false,
+        notes: [],
       };
     }
     return invoke<ForceUninstallReport>("force_uninstall", { target: app });
@@ -455,6 +457,8 @@ export const backend = {
           { label: "Removed shortcuts", ok: true },
         ],
         complete: true,
+        filesUnknown: false,
+        notes: [],
       };
     }
     return invoke<ForceUninstallReport>("force_uninstall_elevated", { target: app });

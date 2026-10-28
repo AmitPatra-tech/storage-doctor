@@ -137,6 +137,11 @@ export interface ForceUninstallReport {
   /** No matching registry entry and (if it had one) no install folder left —
    *  the practical definition of "actually uninstalled now". */
   complete: boolean;
+  /** The registry entry is gone, but Windows never recorded where the
+   *  program's files are, so their removal can't be confirmed. */
+  filesUnknown: boolean;
+  /** Plain-language explanations of anything that did not work. */
+  notes: string[];
 }
 
 export interface SearchProgress {
