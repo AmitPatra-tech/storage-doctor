@@ -55,11 +55,11 @@ export function useSmartDelete() {
    *  Returns null when the force delete itself could not run (e.g. the
    *  administrator prompt was declined); `failed` is left unchanged then. */
   const forceDelete = useCallback(
-    async (paths: string[], source?: string, permanent = false) => {
+    async (paths: string[], approved: string[], source?: string, permanent = false) => {
       setBusy(true);
       setError(null);
       try {
-        const res = await backend.forceDeletePaths(paths, source, permanent);
+        const res = await backend.forceDeletePaths(paths, source, permanent, approved);
         setFreed((f) => f + res.freedBytes);
         setForceResult(res);
         setFailed([

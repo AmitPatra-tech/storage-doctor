@@ -1,7 +1,8 @@
 //! "Run as administrator" — one UAC prompt per session instead of one per
 //! Force Delete / Force Uninstall. When the user turns it on, Storage Doctor
 //! relaunches itself elevated at startup; every admin step in that session
-//! then runs directly, with no further prompt. Off by default.
+//! then runs directly, with no further prompt. On by default (one prompt per
+//! launch, like other system tools); it can be turned off in Settings.
 
 use std::path::PathBuf;
 
@@ -12,11 +13,12 @@ const WAIT_PID_FLAG: &str = "--wait-pid=";
 /// Name of the mutex every running UI instance holds.
 const INSTANCE_MUTEX: &str = "Local\\HutZon.StorageDoctor.Instance";
 
-fn flag_path() -> PathBuf {
+/// Present only when the user turned "Run as administrator" off.
+fn off_flag_path() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("StorageDoctor")
-        .join("run_as_admin")
+        .join("run_as_admin_off")
 }
 
 fn wide(s: &str) -> Vec<u16> {
@@ -28,24 +30,24 @@ pub fn is_elevated() -> bool {
     unsafe { windows_sys::Win32::UI::Shell::IsUserAnAdmin() != 0 }
 }
 
-/// Whether the user turned on "Run as administrator".
+/// Whether "Run as administrator" is on (the default).
 pub fn run_as_admin_enabled() -> bool {
-    flag_path().exists()
+    !off_flag_path().exists()
 }
 
 pub fn set_run_as_admin(enabled: bool) -> Result<(), String> {
-    let path = flag_path();
+    let path = off_flag_path();
     if enabled {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        std::fs::write(&path, b"1").map_err(|e| e.to_string())
-    } else {
         match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.to_string()),
         }
+    } else {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+        }
+        std::fs::write(&path, b"1").map_err(|e| e.to_string())
     }
 }
 

@@ -283,3 +283,19 @@ export interface Orphan {
   /** Where it was found, e.g. "AppData (Roaming)". */
   location: string;
 }
+
+/** A program holding an item open, shown before a force delete. */
+export interface LockHolder {
+  /** Process name — what the user approves, e.g. "WINWORD". */
+  exe: string;
+  display: string;
+  /** Force Delete would close it, if ticked. */
+  closable: boolean;
+  /** For programs that are never closed: why. */
+  reason: string | null;
+}
+
+export interface ForcePreviewItem {
+  path: string;
+  holders: LockHolder[];
+}

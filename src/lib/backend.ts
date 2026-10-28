@@ -20,6 +20,7 @@ import type {
   ScanSummary,
   SearchProgress,
   SearchResultItem,
+  ForcePreviewItem,
   Orphan,
   StoreApp,
   StoreRemoveResult,
@@ -508,10 +509,33 @@ export const backend = {
    *  safe to close) and retries. Anything still held is reported with what
    *  holds it; a restart deletion is scheduled only when nothing holds it.
    *  One UAC prompt. */
+  /** Lists, without changing anything, which programs hold each item open
+   *  and which of them Force Delete would close — shown for consent first. */
+  async forceDeletePreview(paths: string[]): Promise<ForcePreviewItem[]> {
+    if (!isTauri) {
+      return paths.map((path, i) => ({
+        path,
+        holders:
+          i === 0
+            ? [
+                { exe: "WINWORD", display: "Microsoft Word (WINWORD.exe)", closable: true, reason: null },
+                { exe: "Claude", display: "Claude (claude.exe)", closable: true, reason: null },
+                { exe: "msedgewebview2", display: "msedgewebview2.exe", closable: false, reason: "msedgewebview2.exe: the Microsoft Edge WebView2 display engine that Storage Doctor and many other apps run on. It is never closed. Close the app it belongs to, then try again." },
+              ]
+            : [],
+      }));
+    }
+    return invoke("force_delete_preview", { paths });
+  },
+
+  /** Force delete. Closes only the programs in `approved` (the ones the
+   *  user ticked in the preview); anything else holding an item is
+   *  reported, never closed. */
   async forceDeletePaths(
     paths: string[],
-    source?: string,
-    permanent = false
+    source: string | undefined,
+    permanent: boolean,
+    approved: string[]
   ): Promise<ForceDeleteResult> {
     if (!isTauri) {
       // Browser preview: one of each outcome, so every result view renders.
@@ -530,7 +554,7 @@ export const backend = {
         elevationDeclined: false,
       };
     }
-    return invoke<ForceDeleteResult>("force_delete_paths", { paths, source, permanent });
+    return invoke<ForceDeleteResult>("force_delete_paths", { paths, source, permanent, approved });
   },
 
   async regenerateRecommendations(): Promise<void> {

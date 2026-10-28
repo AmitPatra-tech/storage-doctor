@@ -140,8 +140,9 @@ function SafeCleanModal({
         <>
           <p className="mb-3 text-sm text-muted">
             Everything below was identified as safe to delete — caches, temporary files
-            and other content that applications recreate automatically. Files go to the
-            Recycle Bin.
+            and other content that applications recreate automatically. They are deleted
+            permanently, so the space is freed straight away. Files in use by running programs
+            are skipped.
           </p>
           <div className="flex flex-col divide-y divide-border">
             {items.map((item: SafeItem) => (

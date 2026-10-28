@@ -118,7 +118,7 @@ export function Recommendations() {
                   <Button
                     variant="danger"
                     size="sm"
-                    title="Delete to Recycle Bin (uses admin rights if required)"
+                    title="Delete permanently to free the space (asks for administrator rights only if needed)"
                     onClick={() => setTarget(rec)}
                   >
                     <Trash2 className="h-3.5 w-3.5" />
@@ -138,6 +138,7 @@ export function Recommendations() {
         knownTotalBytes={target?.recoverableBytes}
         source={target?.name}
         permanent
+        allowForce={false}
         onDone={afterDelete}
         onClose={() => setTarget(null)}
       />

@@ -84,6 +84,7 @@ pub fn run() {
             commands::delete_paths,
             commands::delete_paths_elevated,
             commands::force_delete_paths,
+            commands::force_delete_preview,
             commands::find_safe_cleanup,
             commands::find_duplicates,
             commands::search,

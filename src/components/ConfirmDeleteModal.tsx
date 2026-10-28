@@ -5,7 +5,8 @@ import { Button } from "@/components/ui/button";
 import { SafetyBadge } from "@/components/ui/badge";
 import { formatBytes } from "@/lib/utils";
 import { useSmartDelete } from "@/hooks/useSmartDelete";
-import type { Classification, ItemNote } from "@/lib/types";
+import type { Classification, ForcePreviewItem, ItemNote } from "@/lib/types";
+import { backend } from "@/lib/backend";
 
 export interface DeleteItem {
   path: string;
@@ -16,7 +17,7 @@ export interface DeleteItem {
 /** Which retry, if any, has already been attempted — drives which failure
  *  stage is shown, since an administrator retry and a force-delete retry
  *  need different explanations and actions. */
-type Attempt = "none" | "elevated" | "force";
+type Attempt = "none" | "elevated" | "preview" | "force";
 
 /** What has been removed so far, worded for what actually happened to the
  *  space: permanently deleted items free it; Recycle Bin items do not until
@@ -71,6 +72,7 @@ export function ConfirmDeleteModal({
   knownTotalBytes,
   source,
   permanent = false,
+  allowForce = true,
   onDone,
   onClose,
 }: {
@@ -83,6 +85,10 @@ export function ConfirmDeleteModal({
   source?: string;
   /** Permanently delete (frees space) instead of moving to the Recycle Bin. */
   permanent?: boolean;
+  /** Offer Force Delete (closing programs) for items still in use. Off for
+   *  cache and Temp cleanups: files in use there belong to running programs
+   *  and are simply skipped. */
+  allowForce?: boolean;
   /** `removedBytes`: size of what is gone. `remaining`: paths still there. */
   onDone: (removedBytes: number, remaining: string[]) => void;
   onClose: () => void;
@@ -92,12 +98,21 @@ export function ConfirmDeleteModal({
   const [attempt, setAttempt] = useState<Attempt>("none");
   /** The first delete has run — the item list gives way to results. */
   const [started, setStarted] = useState(false);
+  /** What holds each still-there item open, for consent before closing. */
+  const [preview, setPreview] = useState<ForcePreviewItem[] | null>(null);
+  const [previewBusy, setPreviewBusy] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  /** Programs (process names) the user ticked to be closed. */
+  const [approved, setApproved] = useState<Set<string>>(new Set());
 
   useEffect(() => {
     if (open) {
       reset();
       setAttempt("none");
       setStarted(false);
+      setPreview(null);
+      setApproved(new Set());
+      setPreviewError(null);
     }
   }, [open, reset]);
 
@@ -116,13 +131,61 @@ export function ConfirmDeleteModal({
   const retryElevated = async () => {
     const res = await run(failed, true, source, permanent);
     setAttempt("elevated");
+    // Cache cleanups never force anything — but say exactly what is using the
+    // items rather than assume it (read-only lookup, nothing is closed).
+    if (!allowForce && res.failed.length > 0) {
+      try {
+        setPreview(await backend.forceDeletePreview(res.failed));
+      } catch {
+        setPreview(null);
+      }
+    }
     if (res.failed.length === 0 && res.refused.length === 0 && refused.length === 0) {
       onDone(freed + res.freedBytes, []);
     }
   };
 
+  /** Step 1 of force delete: show who holds the items. Nothing is closed. */
+  const showPreview = async () => {
+    setPreviewBusy(true);
+    setPreviewError(null);
+    try {
+      setPreview(await backend.forceDeletePreview(failed));
+      setApproved(new Set());
+      setAttempt("preview");
+    } catch (e) {
+      setPreviewError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setPreviewBusy(false);
+    }
+  };
+
+  // One entry per program across all items, since consent is per program.
+  const programs = (() => {
+    const map = new Map<string, { exe: string; display: string; closable: boolean; reason: string | null; items: string[] }>();
+    for (const item of preview ?? []) {
+      for (const h of item.holders) {
+        const key = h.closable ? h.exe.toLowerCase() : `${h.exe.toLowerCase()}|${h.reason ?? ""}`;
+        const entry = map.get(key) ?? { ...h, items: [] };
+        if (!entry.items.includes(item.path)) entry.items.push(item.path);
+        map.set(key, entry);
+      }
+    }
+    return [...map.values()];
+  })();
+  const closable = programs.filter((p) => p.closable);
+  const keptOpen = programs.filter((p) => !p.closable);
+
+  const toggleApproved = (exe: string) => {
+    const next = new Set(approved);
+    if (next.has(exe)) next.delete(exe);
+    else next.add(exe);
+    setApproved(next);
+  };
+
+  /** Step 2: force delete, closing only the ticked programs. */
   const retryForce = async () => {
-    const res = await forceDelete(failed, source, permanent);
+    const res = await forceDelete(failed, [...approved], source, permanent);
     // Only switch to the result view when the force delete actually ran; if
     // it could not (e.g. the administrator prompt was declined) the error is
     // shown and the items stay offered for another try.
@@ -151,10 +214,21 @@ export function ConfirmDeleteModal({
                 <ShieldAlert className="h-3.5 w-3.5" />
                 {busy ? "Requesting admin…" : `Retry ${failed.length} as administrator`}
               </Button>
+            ) : attempt === "elevated" ? (
+              allowForce && (
+                <Button variant="danger" size="sm" disabled={previewBusy} onClick={showPreview}>
+                  <Zap className="h-3.5 w-3.5" />
+                  {previewBusy ? "Checking what uses them…" : `Force Delete ${failed.length} item(s)…`}
+                </Button>
+              )
             ) : (
               <Button variant="danger" size="sm" disabled={busy} onClick={retryForce}>
                 <Zap className="h-3.5 w-3.5" />
-                {busy ? "Closing programs…" : `Force Delete ${failed.length} item(s)`}
+                {busy
+                  ? "Working…"
+                  : approved.size > 0
+                    ? `Close ${approved.size} program(s) and delete`
+                    : "Delete without closing anything"}
               </Button>
             )}
           </>
@@ -239,14 +313,70 @@ export function ConfirmDeleteModal({
             <ShieldAlert className="mt-0.5 h-4 w-4 shrink-0" />
             <span>
               {failed.length} item(s) could not be {verb} even as administrator.{" "}
-              {progressNote(freed, permanent)} Force Delete finds the programs that have them
-              open, closes them (unsaved work in those programs is lost) and tries again.
-              Windows itself, services, virtual machines and system processes are never
-              closed — if one of those holds an item, you are told which one.
+              {progressNote(freed, permanent)}{" "}
+              {allowForce
+                ? "Force Delete first shows you which programs have them open; only the ones you tick are closed."
+                : preview === null
+                  ? "They were skipped. Nothing is force-closed for a cache cleanup."
+                  : programs.length > 0
+                    ? `They are in use by: ${programs.map((p) => p.display).join(", ")}. They were skipped — nothing is force-closed for a cache cleanup. Close those programs (or restart) and clean again.`
+                    : "No running program was found using them, so Windows refused for another reason (such as a protected file). They were skipped."}
             </span>
           </div>
           <PathList paths={failed} />
         </>
+      )}
+
+      {attempt === "elevated" && previewError && (
+        <p className="mt-2 text-xs text-danger">{previewError}</p>
+      )}
+
+      {attempt === "preview" && preview && (
+        <div className="flex flex-col gap-3 text-sm">
+          {closable.length > 0 && (
+            <div className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2.5">
+              <p className="text-warning">
+                These programs have the items open. Tick the ones that may be closed —
+                unsaved work in them is lost. Unticked programs are left running.
+              </p>
+              <div className="mt-2 flex flex-col gap-1.5">
+                {closable.map((p) => (
+                  <label key={p.exe} className="flex cursor-pointer items-start gap-2">
+                    <input
+                      type="checkbox"
+                      className="mt-1"
+                      checked={approved.has(p.exe)}
+                      onChange={() => toggleApproved(p.exe)}
+                    />
+                    <span className="min-w-0">
+                      <span className="font-medium text-foreground">{p.display}</span>
+                      <span className="block truncate text-xs text-muted" title={p.items.join("\n")}>
+                        uses {p.items.length === 1 ? p.items[0] : `${p.items.length} of these items`}
+                      </span>
+                    </span>
+                  </label>
+                ))}
+              </div>
+            </div>
+          )}
+          {keptOpen.length > 0 && (
+            <div className="rounded-md border border-border px-3 py-2.5">
+              <p>Also using them — these are never closed:</p>
+              <ul className="mt-1 list-disc pl-5 text-xs text-muted">
+                {keptOpen.map((p) => (
+                  <li key={`${p.exe}|${p.reason}`}>{p.reason ?? p.display}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+          {programs.length === 0 && (
+            <p className="text-muted">
+              No running program was found holding these items, so nothing will be closed. They
+              will be retried with administrator rights, taking ownership if needed.
+            </p>
+          )}
+          <PathList paths={failed} />
+        </div>
       )}
 
       {started && refused.length > 0 && (

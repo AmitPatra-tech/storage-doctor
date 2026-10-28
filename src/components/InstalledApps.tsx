@@ -556,6 +556,7 @@ export function InstalledApps() {
         knownTotalBytes={cleanTarget?.total}
         source={cleanTarget ? `${cleanTarget.name} caches` : undefined}
         permanent
+        allowForce={false}
         onDone={(bytes, remaining) => {
           setNotice(removalNotice(bytes, true, remaining.length));
           setCleanTarget(null);

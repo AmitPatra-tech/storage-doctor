@@ -961,6 +961,26 @@ pub(crate) fn delete_refusal(path: &str, force: bool) -> Option<String> {
         );
     }
     if force {
+        // Temp folders are shared by every running program. Force deleting
+        // one would close all of them (and did: it closed Storage Doctor's
+        // own window, Claude and Wispr Flow). Files in use there are simply
+        // skipped by a normal cleanup.
+        let temps = [
+            env("TEMP"),
+            env("TMP"),
+            env("LOCALAPPDATA").map(|l| l.join("Temp")),
+            env("SystemRoot").map(|w| w.join("Temp")),
+            env("SystemRoot").map(|w| w.join("SystemTemp")),
+        ];
+        if temps.iter().flatten().any(|t| canon(t) == target) {
+            return Some(
+                "This is a Temp folder shared by every running program. Force delete would close \
+                 all of them, so it is never force deleted. Files still in use in it are skipped \
+                 by a normal cleanup; they can be removed after those programs close or after a \
+                 restart."
+                    .into(),
+            );
+        }
         if let Some(win) = env("SystemRoot") {
             let win = canon(&win);
             let cleanup = ["temp", "logs", "minidump", "livekernelreports", "softwaredistribution\\download"];
@@ -1574,8 +1594,34 @@ public class SDForceDelete {
         "System", "Registry", "Idle", "Memory Compression", "smss", "csrss", "wininit",
         "winlogon", "services", "lsass", "lsaiso", "svchost", "dwm", "fontdrvhost",
         "sihost", "ctfmon", "audiodg", "conhost", "MsMpEng", "NisSrv", "SecurityHealthService",
-        "vmwp", "vmmem", "vmcompute", "vmms", "storage-doctor"
+        "vmwp", "vmmem", "vmcompute", "vmms", "storage-doctor",
+        // The shared WebView2 display engine: Storage Doctor's own window and
+        // many other apps render with it. Closing it blanks all of them.
+        "msedgewebview2"
     };
+
+    /// Process IDs never closed: Storage Doctor and everything it started.
+    public static HashSet<int> Protected = new HashSet<int>();
+
+    /// When not null, only these programs (process names) may be closed —
+    /// the ones the user saw and agreed to. Anything else holding the item
+    /// is reported instead of closed.
+    public static HashSet<string> Approved = null;
+
+    /// Protects rootPid and all of its descendants.
+    public static void ProtectTree(int rootPid, int[] pids, int[] parents) {
+        var queue = new Queue<int>();
+        var seen = new HashSet<int>();
+        queue.Enqueue(rootPid);
+        while (queue.Count > 0) {
+            int x = queue.Dequeue();
+            if (!seen.Add(x)) continue;
+            Protected.Add(x);
+            for (int i = 0; i < pids.Length; i++) {
+                if (parents[i] == x && pids[i] != x) queue.Enqueue(pids[i]);
+            }
+        }
+    }
 
     public class Locker {
         public int Pid;
@@ -1586,7 +1632,7 @@ public class SDForceDelete {
         public bool Closable;
     }
 
-    /// Everything Windows reports as holding `path` — or, for a folder, any
+    /// Everything Windows reports as holding path — or, for a folder, any
     /// file inside it — open. Includes the System process (PID 4) and
     /// critical processes: those are never closed, but they must still be
     /// reported, or the user is told nothing about why the delete failed.
@@ -1629,7 +1675,9 @@ public class SDForceDelete {
                     && l.Type != 1000 /* RmCritical */
                     && l.Type != 3    /* RmService */
                     && l.Service.Length == 0
-                    && !NeverClose.Contains(exe);
+                    && !NeverClose.Contains(exe)
+                    && !Protected.Contains(pid)
+                    && (Approved == null || Approved.Contains(exe));
                 list.Add(l);
             }
         } finally {
@@ -1656,7 +1704,7 @@ public class SDForceDelete {
     }
 
     /// One line telling the user exactly what holds the item and why this
-    /// app did not close it. `closedExes` = process names this run already
+    /// app did not close it. closedExes = process names this run already
     /// closed once (so a survivor of the same name started again).
     public static string Describe(Locker l, HashSet<string> closedExes) {
         string name = DisplayName(l);
@@ -1674,8 +1722,20 @@ public class SDForceDelete {
             return name + ": the Windows service \"" + svc + "\". Services are not stopped automatically; " +
                    "stop it in the Services app, or uninstall the program it belongs to, then try again.";
         }
+        if (Protected.Contains(l.Pid) || lower == "storage-doctor") {
+            return name + ": part of Storage Doctor itself, so it is never closed. Close the other " +
+                   "programs using this item, or restart Storage Doctor, then try again.";
+        }
+        if (lower == "msedgewebview2") {
+            return name + ": the Microsoft Edge WebView2 display engine that Storage Doctor and many " +
+                   "other apps run on. It is never closed. Close the app it belongs to, then try again.";
+        }
         if (l.Type == 1000 || NeverClose.Contains(l.Exe)) {
             return name + ": a Windows system process that cannot be closed safely.";
+        }
+        if (Approved != null && !Approved.Contains(l.Exe)) {
+            return name + ": it was not in the list of programs you agreed to close, so it was " +
+                   "left running. Close it yourself, then try again.";
         }
         if (closedExes != null && closedExes.Contains(l.Exe)) {
             return name + ": it was closed, but started again and re-opened the file. " +
@@ -1697,7 +1757,7 @@ public class SDForceDelete {
         }
     }
 
-    /// Schedules `path` — and, for a folder, everything inside it, deepest
+    /// Schedules path — and, for a folder, everything inside it, deepest
     /// first — to be removed the moment Windows starts up next. A folder
     /// with more than a couple of thousand entries is skipped rather than
     /// scheduled partially: PendingFileRenameOperations is a single registry
@@ -1752,9 +1812,15 @@ fn new_force_report_path() -> PathBuf {
 /// `closed\t<path>\t<program>`, `blocked\t<path>\t<explanation>`,
 /// `unschedulable\t<path>\t`, and a final `done` line proving the script ran
 /// to the end (it is absent if the UAC prompt was declined).
-pub(crate) fn build_force_delete_script(paths: &[String], permanent: bool, report: &Path) -> String {
+pub(crate) fn build_force_delete_script(
+    paths: &[String],
+    permanent: bool,
+    report: &Path,
+    approved: Option<&[String]>,
+) -> String {
     let mut script = String::from("Add-Type -AssemblyName Microsoft.VisualBasic\n");
     script.push_str(FORCE_DELETE_HELPER);
+    script.push_str(&protection_setup(std::process::id(), approved));
     script.push_str("$sdOut = New-Object 'System.Collections.Generic.List[string]'\n");
 
     for path in paths {
@@ -1779,6 +1845,132 @@ pub(crate) fn build_force_delete_script(paths: &[String], permanent: bool, repor
          try {{ [System.IO.File]::WriteAllLines('{rf}', $sdOut) }} catch {{ }}\n"
     ));
     script
+}
+
+/// PowerShell run right after `FORCE_DELETE_HELPER`: never close
+/// `protect_pid` (Storage Doctor, or the right-click process) or anything it
+/// started; and, when `approved` is given, close only those programs
+/// (process names the user saw and agreed to) — everything else holding an
+/// item is reported, not closed.
+pub(crate) fn protection_setup(protect_pid: u32, approved: Option<&[String]>) -> String {
+    let mut s = format!(
+        "[void][SDForceDelete]::Protected.Add({protect_pid})\n\
+         try {{ $sdAll = @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId -ErrorAction Stop); \
+         [SDForceDelete]::ProtectTree({protect_pid}, [int[]]@($sdAll | ForEach-Object {{ [int]$_.ProcessId }}), [int[]]@($sdAll | ForEach-Object {{ [int]$_.ParentProcessId }})) }} catch {{ }}\n"
+    );
+    if let Some(names) = approved {
+        s.push_str("[SDForceDelete]::Approved = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)\n");
+        for n in names {
+            let esc = n.replace('\'', "''");
+            s.push_str(&format!("[void][SDForceDelete]::Approved.Add('{esc}')\n"));
+        }
+    }
+    s
+}
+
+/// One program found holding an item open, as shown to the user before a
+/// force delete: what it is, and whether Force Delete would close it.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct LockHolder {
+    /// Process name, e.g. "WINWORD" — what the user approves.
+    pub exe: String,
+    /// What to show, e.g. "Microsoft Word (WINWORD.exe)".
+    pub display: String,
+    /// Force Delete would close it (if approved).
+    pub closable: bool,
+    /// For holders that are never closed: why, and what to do.
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct ForcePreviewItem {
+    pub path: String,
+    pub holders: Vec<LockHolder>,
+}
+
+/// Read-only script listing what holds each path open. Lines:
+/// `lock\t<path>\t<exe>\t<1|0 closable>\t<display>\t<reason>`, then `done`.
+pub(crate) fn build_force_preview_script(paths: &[String], report: &Path) -> String {
+    let mut script = String::from(FORCE_DELETE_HELPER);
+    script.push_str(&protection_setup(std::process::id(), None));
+    script.push_str("$sdOut = New-Object 'System.Collections.Generic.List[string]'\n");
+    for path in paths {
+        let esc = path.replace('\'', "''");
+        script.push_str(&format!(
+            "try {{ foreach ($l in @([SDForceDelete]::GetLockers('{esc}'))) {{ \
+               $r = ''; if (-not $l.Closable) {{ $r = [SDForceDelete]::Describe($l, $null) }}; \
+               $sdOut.Add(\"lock`t\" + '{esc}' + \"`t\" + $l.Exe + \"`t\" + [int]$l.Closable + \"`t\" + [SDForceDelete]::DisplayName($l) + \"`t\" + $r) }} }} catch {{ }}\n"
+        ));
+    }
+    let rf = report.to_string_lossy().replace('\'', "''");
+    script.push_str(&format!(
+        "$sdOut.Add('done')\ntry {{ [System.IO.File]::WriteAllLines('{rf}', $sdOut) }} catch {{ }}\n"
+    ));
+    script
+}
+
+fn parse_force_preview(text: &str, paths: &[String]) -> Vec<ForcePreviewItem> {
+    let mut items: Vec<ForcePreviewItem> = paths
+        .iter()
+        .map(|p| ForcePreviewItem { path: p.clone(), holders: Vec::new() })
+        .collect();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.splitn(6, '\t').collect();
+        if parts.len() < 5 || parts[0].trim_start_matches('\u{feff}') != "lock" {
+            continue;
+        }
+        let holder = LockHolder {
+            exe: parts[2].to_string(),
+            display: parts[4].to_string(),
+            closable: parts[3] == "1",
+            reason: parts.get(5).map(|r| r.to_string()).filter(|r| !r.is_empty()),
+        };
+        if let Some(item) = items.iter_mut().find(|i| i.path == parts[1]) {
+            if !item.holders.contains(&holder) {
+                item.holders.push(holder);
+            }
+        }
+    }
+    items
+}
+
+/// Lists, without changing anything, which programs hold each path open and
+/// which of them Force Delete would close — shown to the user for consent
+/// before anything is closed. Runs with this session's rights (no prompt);
+/// in a non-administrator session a program running as administrator may
+/// not be listed, but Force Delete never closes a program that wasn't
+/// approved here.
+pub(crate) fn force_preview(paths: &[String]) -> Result<Vec<ForcePreviewItem>, String> {
+    use std::os::windows::process::CommandExt;
+    let report = new_force_report_path();
+    let script = build_force_preview_script(paths, &report);
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("{}_{stamp}_sd_preview.ps1", std::process::id()));
+    std::fs::write(&tmp, script).map_err(|e| e.to_string())?;
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"])
+        .arg(&tmp)
+        .creation_flags(0x0800_0000)
+        .status();
+    let _ = std::fs::remove_file(&tmp);
+    let text = std::fs::read_to_string(&report).unwrap_or_default();
+    let _ = std::fs::remove_file(&report);
+    Ok(parse_force_preview(&text, paths))
+}
+
+#[tauri::command]
+pub async fn force_delete_preview(paths: Vec<String>) -> Result<Vec<ForcePreviewItem>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (paths, _refused) = split_refused(paths, true);
+        force_preview(&paths)
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// What the elevated force-delete script reported, parsed from its file.
@@ -2017,6 +2209,7 @@ pub async fn force_delete_paths(
     paths: Vec<String>,
     source: Option<String>,
     permanent: Option<bool>,
+    approved: Vec<String>,
 ) -> Result<ForceDeleteResult, String> {
     let label = source.unwrap_or_else(|| "Force delete".into());
     let permanent = permanent.unwrap_or(false);
@@ -2031,7 +2224,8 @@ pub async fn force_delete_paths(
             ForceReport { completed: true, ..Default::default() }
         } else {
             let report_path = new_force_report_path();
-            let script = build_force_delete_script(&paths, permanent, &report_path);
+            // Only the programs the user saw in the preview and agreed to close.
+            let script = build_force_delete_script(&paths, permanent, &report_path, Some(&approved));
             let run = run_elevated_powershell(&script, "storage_doctor_force_delete.ps1");
             let report = read_force_report(&report_path);
             ensure_explorer_running();
@@ -2724,10 +2918,10 @@ pub fn force_delete_cli(path: &str) {
 
     let confirm = message_box(
         &format!(
-            "Force delete this item?\n\n{path}\n\n\
-             • Programs that have it open will be closed. Unsaved work in them is lost.\n\
-             • It goes to the Recycle Bin. An item too large for the Recycle Bin is \
-             deleted permanently."
+            "Delete this item?\n\n{path}\n\n\
+             It goes to the Recycle Bin (an item too large for the Recycle Bin is deleted \
+             permanently). If a program has it open, you'll see which one and be asked \
+             before anything is closed."
         ),
         front | MB_YESNO | MB_ICONWARNING,
     );
@@ -2745,9 +2939,46 @@ pub fn force_delete_cli(path: &str) {
         return;
     }
 
-    // 2) Still there → locked or permission-denied. One elevated pass.
+    // 2) Still there. Show exactly what holds it and ask before closing anything.
+    let holders: Vec<LockHolder> = force_preview(&[path.to_string()])
+        .ok()
+        .and_then(|v| v.into_iter().next())
+        .map(|i| i.holders)
+        .unwrap_or_default();
+    let to_close: Vec<&LockHolder> = holders.iter().filter(|h| h.closable).collect();
+    let kept: Vec<&LockHolder> = holders.iter().filter(|h| !h.closable).collect();
+    let mut text = format!("Windows could not delete it normally:\n{path}\n\n");
+    if !to_close.is_empty() {
+        text.push_str("These programs have it open and will be CLOSED (unsaved work in them is lost):\n");
+        for h in &to_close {
+            text.push_str(&format!("• {}\n", h.display));
+        }
+        text.push('\n');
+    }
+    if !kept.is_empty() {
+        text.push_str("Also holding it — these are never closed:\n");
+        for h in &kept {
+            text.push_str(&format!("• {}\n", h.reason.as_deref().unwrap_or(&h.display)));
+        }
+        text.push('\n');
+    }
+    if to_close.is_empty() && kept.is_empty() {
+        text.push_str("No running program was found holding it, so nothing will be closed. \
+                       It will be retried with administrator rights.\n\n");
+    }
+    text.push_str(if to_close.is_empty() {
+        "Retry with administrator rights?"
+    } else {
+        "Close these programs and delete it?"
+    });
+    if message_box(&text, front | MB_YESNO | MB_ICONWARNING) != IDYES {
+        return;
+    }
+    // Only the programs listed above may be closed.
+    let approved: Vec<String> = to_close.iter().map(|h| h.exe.clone()).collect();
+
     let report_path = new_force_report_path();
-    let script = build_force_delete_script(&[path.to_string()], false, &report_path);
+    let script = build_force_delete_script(&[path.to_string()], false, &report_path, Some(&approved));
     let run = run_elevated_powershell(&script, "storage_doctor_force_delete_cli.ps1");
     let report = read_force_report(&report_path);
     ensure_explorer_running();
@@ -2861,7 +3092,7 @@ mod tests {
         let report = std::env::var("SD_FDTEST_REPORT").expect("SD_FDTEST_REPORT");
         std::fs::write(
             &out,
-            build_force_delete_script(&[path], false, Path::new(&report)),
+            build_force_delete_script(&[path], false, Path::new(&report), None),
         )
         .unwrap();
     }
@@ -2873,7 +3104,7 @@ mod tests {
     fn live_force_delete() {
         let path = std::env::var("SD_LIVE_PATH").expect("SD_LIVE_PATH");
         let report_path = new_force_report_path();
-        let script = build_force_delete_script(&[path.clone()], false, &report_path);
+        let script = build_force_delete_script(&[path.clone()], false, &report_path, None);
         let run = run_elevated_powershell(&script, "sd_live_fd.ps1");
         let r = read_force_report(&report_path);
         println!("ELEVATED_PROCESS={}", crate::elevation::is_elevated());
@@ -2884,6 +3115,106 @@ mod tests {
         println!("BLOCKED={:?}", r.blocked_for(&path));
         println!("UNSCHEDULABLE={:?}", r.unschedulable);
         println!("PENDING_REBOOT={}", has_pending_reboot_delete(&path));
+    }
+
+    /// LIVE, elevated: proves on real processes that (1) a program started
+    /// by this process (standing in for Storage Doctor's own window) is never
+    /// closed, (2) the preview lists an outside holder as closable, (3) an
+    /// unticked program is left running, (4) a ticked one is closed and the
+    /// file deleted.
+    #[test]
+    #[ignore]
+    fn live_protection_and_consent() {
+        use std::os::windows::process::CommandExt;
+        let dir = std::env::temp_dir().join(format!("sd_consent_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let hold = |file: &std::path::Path| {
+            std::fs::write(file, b"x").unwrap();
+            let cmd = format!(
+                "$f=[System.IO.File]::Open('{}','Open','ReadWrite','None'); Start-Sleep -Seconds 120",
+                file.display()
+            );
+            let child = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-Command", &cmd])
+                .creation_flags(0x0800_0000)
+                .spawn()
+                .unwrap();
+            for _ in 0..40 {
+                std::thread::sleep(std::time::Duration::from_millis(250));
+                if std::fs::OpenOptions::new().write(true).open(file).is_err() {
+                    break;
+                }
+            }
+            child
+        };
+        let alive = |pid: u32| {
+            let out = std::process::Command::new("tasklist")
+                .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+                .creation_flags(0x0800_0000)
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+        };
+
+        // (1) Our own child holds the file: protected, never closed.
+        let own = dir.join("own.txt");
+        let mut own_child = hold(&own);
+        let r1 = new_force_report_path();
+        let script = build_force_delete_script(&[own.to_string_lossy().to_string()], false, &r1, None);
+        println!("1 RUN={:?}", run_elevated_powershell(&script, "sd_live_c1.ps1"));
+        let rep = read_force_report(&r1);
+        println!("1 OWN CHILD STILL RUNNING={} FILE EXISTS={} BLOCKED={:?}",
+            alive(own_child.id()), own.exists(), rep.blocked_for(&own.to_string_lossy()));
+        let _ = own_child.kill();
+
+        // (2)-(4) An outside program holds the file (started via cmd /c start,
+        // so it is not our descendant).
+        let other = dir.join("other.txt");
+        std::fs::write(&other, b"x").unwrap();
+        let cmd = format!(
+            "$f=[System.IO.File]::Open('{}','Open','ReadWrite','None'); Start-Sleep -Seconds 120",
+            other.display()
+        );
+        let _ = std::process::Command::new("cmd")
+            .raw_arg(format!("/c start \"\" /min powershell -NoProfile -Command \"{cmd}\""))
+            .creation_flags(0x0800_0000)
+            .status();
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            if std::fs::OpenOptions::new().write(true).open(&other).is_err() {
+                break;
+            }
+        }
+        let path = other.to_string_lossy().to_string();
+        let preview = force_preview(&[path.clone()]).unwrap();
+        println!("2 PREVIEW={:?}", preview[0].holders);
+
+        let r3 = new_force_report_path();
+        let script = build_force_delete_script(&[path.clone()], false, &r3, Some(&["notepad".to_string()]));
+        println!("3 RUN={:?}", run_elevated_powershell(&script, "sd_live_c3.ps1"));
+        let rep = read_force_report(&r3);
+        println!("3 UNTICKED: FILE EXISTS={} CLOSED={:?} BLOCKED={:?}", other.exists(), rep.closed_programs(), rep.blocked_for(&path));
+
+        let r4 = new_force_report_path();
+        let script = build_force_delete_script(&[path.clone()], false, &r4, Some(&["powershell".to_string()]));
+        println!("4 RUN={:?}", run_elevated_powershell(&script, "sd_live_c4.ps1"));
+        let rep = read_force_report(&r4);
+        println!("4 TICKED: FILE EXISTS={} CLOSED={:?}", other.exists(), rep.closed_programs());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// LIVE, READ-ONLY, no elevation: the consent preview for SD_LIVE_PATH,
+    /// plus whether force delete would refuse it outright.
+    #[test]
+    #[ignore]
+    fn live_preview() {
+        let path = std::env::var("SD_LIVE_PATH").expect("SD_LIVE_PATH");
+        println!("FORCE_REFUSAL={:?}", delete_refusal(&path, true));
+        for item in force_preview(&[path]).unwrap() {
+            for h in item.holders {
+                println!("HOLDER closable={} {} | {}", h.closable, h.display, h.reason.unwrap_or_default());
+            }
+        }
     }
 
     /// LIVE, elevated, READ-ONLY: reports what holds SD_LIVE_PATH open, using
@@ -2923,7 +3254,7 @@ mod tests {
     }
 
     fn script_for(path: &str, permanent: bool) -> String {
-        build_force_delete_script(&[path.to_string()], permanent, Path::new(r"C:\r.txt"))
+        build_force_delete_script(&[path.to_string()], permanent, Path::new(r"C:\r.txt"), None)
     }
 
     #[test]
@@ -3019,14 +3350,64 @@ mod tests {
         assert!(delete_refusal(&sys32, false).is_none());
         assert!(delete_refusal(&sys32, true).is_some());
         // …except the cleanup folders the app's recommendations target.
-        for c in ["Temp", "Temp\\a.tmp", "Logs\\CBS", "Minidump", "SoftwareDistribution\\Download\\x"] {
+        for c in ["Temp\\a.tmp", "Logs\\CBS", "Minidump", "SoftwareDistribution\\Download\\x"] {
             assert!(delete_refusal(&format!("{win}\\{c}"), true).is_none(), "{c} must be allowed");
         }
         assert!(delete_refusal(&format!("{win}\\SoftwareDistribution"), true).is_some());
         assert!(delete_refusal(&format!("{win}\\TempX"), true).is_some(), "no prefix match");
+        // Temp folders themselves: a normal cleanup may empty them, but force
+        // delete (which closes every program using them) is always refused.
+        let user_temp = std::env::var("TEMP").unwrap();
+        for t in [user_temp.clone(), format!("{win}\\Temp")] {
+            assert!(delete_refusal(&t, false).is_none(), "{t}: normal cleanup allowed");
+            assert!(delete_refusal(&t, true).is_some(), "{t}: force must be refused");
+        }
+        assert!(delete_refusal(&format!("{user_temp}\\stuck.tmp"), true).is_none(), "one file in Temp is fine");
         // Ordinary items are never refused.
         assert!(delete_refusal(&format!("{pf}\\SomeApp"), true).is_none());
         assert!(delete_refusal(&format!("{profile}\\Downloads\\a.zip"), true).is_none());
+    }
+
+    /// The C# helper is embedded in a PowerShell double-quoted here-string,
+    /// where a backtick is an escape (a comment containing "`r" once broke
+    /// the whole helper) and "$" expands variables.
+    #[test]
+    fn helper_has_no_powershell_escape_or_variable_characters() {
+        let body = FORCE_DELETE_HELPER;
+        assert!(!body.contains('`'), "backtick in FORCE_DELETE_HELPER");
+        assert!(!body.contains('$'), "dollar sign in FORCE_DELETE_HELPER");
+    }
+
+    #[test]
+    fn protection_setup_protects_own_tree_and_limits_closing_to_approved() {
+        let s = protection_setup(4242, Some(&["WINWORD".to_string(), "it's".to_string()]));
+        assert!(s.contains("Protected.Add(4242)"));
+        assert!(s.contains("ProtectTree(4242,"));
+        assert!(s.contains("[SDForceDelete]::Approved = New-Object"));
+        assert!(s.contains("Approved.Add('WINWORD')"));
+        assert!(s.contains("Approved.Add('it''s')"), "names are quote-escaped");
+        // No list = no restriction (force uninstall), but still protected.
+        let open = protection_setup(7, None);
+        assert!(open.contains("Protected.Add(7)") && !open.contains("Approved ="));
+        // The helper itself never closes the WebView2 engine or protected PIDs.
+        assert!(FORCE_DELETE_HELPER.contains("\"msedgewebview2\""));
+        assert!(FORCE_DELETE_HELPER.contains("!Protected.Contains(pid)"));
+        assert!(FORCE_DELETE_HELPER.contains("(Approved == null || Approved.Contains(exe))"));
+    }
+
+    #[test]
+    fn force_preview_parses_holders_per_path() {
+        let paths = vec![r"C:\a".to_string(), r"C:\b".to_string()];
+        let text = "lock\tC:\\a\tWINWORD\t1\tMicrosoft Word (WINWORD.exe)\t\n\
+                    lock\tC:\\a\tmsedgewebview2\t0\tmsedgewebview2.exe\tthe WebView2 engine\n\
+                    lock\tC:\\a\tWINWORD\t1\tMicrosoft Word (WINWORD.exe)\t\n\
+                    done\n";
+        let items = parse_force_preview(text, &paths);
+        assert_eq!(items[0].holders.len(), 2, "duplicates removed");
+        assert!(items[0].holders[0].closable && items[0].holders[0].reason.is_none());
+        assert!(!items[0].holders[1].closable);
+        assert_eq!(items[0].holders[1].reason.as_deref(), Some("the WebView2 engine"));
+        assert!(items[1].holders.is_empty());
     }
 
     #[test]

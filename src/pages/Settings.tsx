@@ -100,8 +100,8 @@ export function Settings() {
     : admin?.elevated
       ? "Running as administrator now: Force Delete and Force Uninstall won't ask for permission this session."
       : admin?.enabled
-        ? "On — takes effect the next time Storage Doctor starts. Restart now to stop the permission prompts this session."
-        : "Ask for administrator permission once when Storage Doctor starts, instead of every time you Force Delete or Force Uninstall.";
+        ? "On, but this session isn't running as administrator (the permission prompt at start was declined or skipped). Restart now to stop the prompts for this session."
+        : "Off — Force Delete, Force Uninstall and app removal ask for administrator permission each time. Turn on to be asked once, when Storage Doctor starts.";
 
   const activateLicense = async () => {
     setLicenseBusy(true);

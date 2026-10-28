@@ -987,6 +987,7 @@ pub fn build_force_uninstall_script(app: &InstalledApp, report: &Path) -> (Strin
     // (locker kill + take-ownership + retry) can run against each path.
     let mut script = String::from("Add-Type -AssemblyName Microsoft.VisualBasic\n");
     script.push_str(crate::commands::FORCE_DELETE_HELPER);
+    script.push_str(&crate::commands::protection_setup(std::process::id(), None));
 
     // Only ever stop a process by its full path, never by bare name — killing
     // every `msedgewebview2.exe` would take down the shared WebView2 Runtime
