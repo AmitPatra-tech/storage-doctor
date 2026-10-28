@@ -20,6 +20,8 @@ import type {
   ScanSummary,
   SearchProgress,
   SearchResultItem,
+  StoreApp,
+  StoreRemoveResult,
 } from "./types";
 
 // In-browser dev (vite without Tauri) falls back to mock data so the UI
@@ -721,6 +723,29 @@ export const backend = {
     if (!isTauri) return "dev";
     const { getVersion } = await import("@tauri-apps/api/app");
     return getVersion();
+  },
+
+  /** Built-in and Microsoft Store apps (Photos, Xbox, Clipchamp…). */
+  async listStoreApps(): Promise<StoreApp[]> {
+    if (!isTauri) {
+      return [
+        { displayName: "Microsoft Clipchamp", name: "Clipchamp.Clipchamp", version: "4.3", publisher: "Microsoft Corp.", installLocation: "", nonRemovable: false, caution: null, sizeBytes: 67 * 2 ** 20 },
+        { displayName: "Microsoft Store", name: "Microsoft.WindowsStore", version: "22510", publisher: "Microsoft Corporation", installLocation: "", nonRemovable: false, caution: "Without the Microsoft Store you can't install or update Store apps, including the ones listed here.", sizeBytes: 129 * 2 ** 20 },
+        { displayName: "Settings", name: "windows.immersivecontrolpanel", version: "10.0", publisher: "Microsoft Windows", installLocation: "", nonRemovable: true, caution: null, sizeBytes: 26 * 2 ** 20 },
+        { displayName: "XBOX", name: "Microsoft.GamingApp", version: "2510", publisher: "Microsoft Corporation", installLocation: "", nonRemovable: false, caution: null, sizeBytes: 324 * 2 ** 20 },
+      ];
+    }
+    return invoke("list_store_apps");
+  },
+
+  /** Removes a built-in/Store app for every account (one admin pass). */
+  async removeStoreApp(name: string): Promise<StoreRemoveResult> {
+    if (!isTauri) {
+      return name === "Microsoft.GamingApp"
+        ? { removed: false, remainingInstalls: 1, stillProvisioned: false, notes: ["Windows reported: Removal failed. Please contact your software vendor."] }
+        : { removed: true, remainingInstalls: 0, stillProvisioned: false, notes: [] };
+    }
+    return invoke("remove_store_app", { name });
   },
 
   /** Whether this session runs as administrator, and whether "Run as

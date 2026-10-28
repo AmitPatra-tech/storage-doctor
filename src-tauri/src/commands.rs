@@ -2223,6 +2223,38 @@ pub fn open_external(url: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Built-in and Microsoft Store apps (no administrator rights needed to list).
+#[tauri::command]
+pub async fn list_store_apps() -> Result<Vec<crate::store_apps::StoreApp>, String> {
+    tauri::async_runtime::spawn_blocking(crate::store_apps::list)
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Removes a built-in / Store app for every user account and stops Windows
+/// adding it back for new accounts. One administrator pass (no prompt in a
+/// "Run as administrator" session). The result is what is actually left,
+/// re-checked afterwards.
+#[tauri::command]
+pub async fn remove_store_app(name: String) -> Result<crate::store_apps::StoreRemoveResult, String> {
+    if !crate::store_apps::valid_package_name(&name) {
+        return Err("Invalid app package name.".into());
+    }
+    tauri::async_runtime::spawn_blocking(move || {
+        let report = new_force_report_path();
+        let script = crate::store_apps::build_remove_script(&name, &report);
+        let run = run_elevated_powershell(&script, "storage_doctor_store_remove.ps1");
+        let text = std::fs::read_to_string(&report).unwrap_or_default();
+        let _ = std::fs::remove_file(&report);
+        if text.is_empty() {
+            return Err(run.err().unwrap_or_else(|| "The administrator step did not run.".into()));
+        }
+        Ok(crate::store_apps::parse_remove_report(&text))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct AdminStatus {

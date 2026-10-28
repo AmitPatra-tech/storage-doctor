@@ -8,6 +8,7 @@ mod elevation;
 mod recommendations;
 pub mod scanner;
 mod shell;
+mod store_apps;
 mod thumbs;
 mod uninstall;
 
@@ -100,6 +101,8 @@ pub fn run() {
             commands::admin_status,
             commands::set_run_as_admin,
             commands::restart_as_admin,
+            commands::list_store_apps,
+            commands::remove_store_app,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

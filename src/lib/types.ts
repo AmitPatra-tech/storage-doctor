@@ -245,3 +245,28 @@ export interface ScanSummary {
   largestFiles: LargeFile[];
   recoverableBytes: number;
 }
+
+/** A built-in or Microsoft Store app (AppX package). */
+export interface StoreApp {
+  displayName: string;
+  /** Package name — what removal targets, e.g. "Microsoft.BingNews". */
+  name: string;
+  version: string;
+  publisher: string;
+  installLocation: string;
+  /** Windows refuses to remove this one (a system component). */
+  nonRemovable: boolean;
+  /** What removing it breaks, when that matters. */
+  caution: string | null;
+  sizeBytes: number;
+}
+
+export interface StoreRemoveResult {
+  /** Gone for every user account on this PC. */
+  removed: boolean;
+  /** Accounts it is still installed for. */
+  remainingInstalls: number;
+  /** Windows will still add it to new accounts. */
+  stillProvisioned: boolean;
+  notes: string[];
+}
