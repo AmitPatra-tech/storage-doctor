@@ -349,7 +349,7 @@ fn split_command_line(s: &str) -> (String, String) {
     }
 }
 
-fn norm(s: &str) -> String {
+pub(crate) fn norm(s: &str) -> String {
     s.chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>()
@@ -379,7 +379,7 @@ fn env_path(name: &str) -> Option<PathBuf> {
 /// the publisher prefix dropped, since installers commonly use just "Chrome"
 /// for the folder or shortcut. Shared by leftover-folder, shortcut and
 /// process matching so all three agree on what counts as "this app".
-fn name_variants(name: &str, publisher: &str) -> Vec<String> {
+pub(crate) fn name_variants(name: &str, publisher: &str) -> Vec<String> {
     let base = base_name(name);
     let mut variants: Vec<String> = vec![norm(name), norm(&base)];
     let name_tokens: Vec<&str> = base.split_whitespace().collect();

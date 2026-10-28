@@ -169,6 +169,31 @@ fn build_candidates(conn: &Connection, scan_id: i64) -> Vec<Candidate> {
         vec![join(&program_data, "Microsoft\\Windows\\DeliveryOptimization")],
     ));
 
+    let system_drive = env_path("SystemDrive").map(|d| PathBuf::from(format!("{}\\", d.to_string_lossy())));
+    candidates.extend(simple(
+        "windows-upgrade-leftovers",
+        "Windows Upgrade Leftovers",
+        "Temporary files Windows Setup leaves behind after a feature update, upgrade or reset. Not needed once it has finished — don't remove them while an update is still in progress.",
+        "medium",
+        false,
+        ["$WINDOWS.~BT", "$WINDOWS.~WS", "$GetCurrent", "$SysReset", "Windows10Upgrade"]
+            .iter()
+            .map(|d| join(&system_drive, d))
+            .collect(),
+    ));
+
+    candidates.extend(simple(
+        "error-reports",
+        "Windows Error Reports",
+        "Copies of problem reports Windows Error Reporting has already processed or queued. Not needed for normal use.",
+        "low",
+        true,
+        vec![
+            join(&program_data, "Microsoft\\Windows\\WER\\ReportArchive"),
+            join(&program_data, "Microsoft\\Windows\\WER\\ReportQueue"),
+        ],
+    ));
+
     candidates.extend(simple(
         "windows-old",
         "Previous Windows Installation",

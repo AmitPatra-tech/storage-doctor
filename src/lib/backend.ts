@@ -20,6 +20,7 @@ import type {
   ScanSummary,
   SearchProgress,
   SearchResultItem,
+  Orphan,
   StoreApp,
   StoreRemoveResult,
 } from "./types";
@@ -723,6 +724,18 @@ export const backend = {
     if (!isTauri) return "dev";
     const { getVersion } = await import("@tauri-apps/api/app");
     return getVersion();
+  },
+
+  /** Folders left by apps that are no longer installed. */
+  async findOrphanedLeftovers(): Promise<Orphan[]> {
+    if (!isTauri) {
+      const now = Date.now() / 1000;
+      return [
+        { path: String.raw`C:\Users\me\AppData\Roaming\discord`, sizeBytes: 31 * 2 ** 20, modifiedUnix: now - 90 * 86400, name: "discord", location: "AppData (Roaming)" },
+        { path: String.raw`C:\Users\me\AppData\Local\CapCut`, sizeBytes: 74 * 2 ** 20, modifiedUnix: now - 3 * 86400, name: "CapCut", location: "AppData (Local)" },
+      ];
+    }
+    return invoke("find_orphaned_leftovers");
   },
 
   /** Built-in and Microsoft Store apps (Photos, Xbox, Clipchamp…). */

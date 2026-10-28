@@ -2223,6 +2223,14 @@ pub fn open_external(url: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Folders left behind by apps that are no longer installed (see `orphans`).
+#[tauri::command]
+pub async fn find_orphaned_leftovers() -> Result<Vec<crate::orphans::Orphan>, String> {
+    tauri::async_runtime::spawn_blocking(crate::orphans::find)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Built-in and Microsoft Store apps (no administrator rights needed to list).
 #[tauri::command]
 pub async fn list_store_apps() -> Result<Vec<crate::store_apps::StoreApp>, String> {

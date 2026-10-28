@@ -270,3 +270,14 @@ export interface StoreRemoveResult {
   stillProvisioned: boolean;
   notes: string[];
 }
+
+/** A folder left behind by an app that is no longer installed. */
+export interface Orphan {
+  path: string;
+  sizeBytes: number;
+  /** Unix seconds anything inside last changed (0 = unknown). */
+  modifiedUnix: number;
+  name: string;
+  /** Where it was found, e.g. "AppData (Roaming)". */
+  location: string;
+}

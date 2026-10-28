@@ -1,6 +1,7 @@
 import { PageHeader } from "@/components/PageHeader";
 import { InstalledApps } from "@/components/InstalledApps";
 import { StoreApps } from "@/components/StoreApps";
+import { OrphanedLeftovers } from "@/components/OrphanedLeftovers";
 
 export function Applications() {
   return (
@@ -11,6 +12,7 @@ export function Applications() {
       />
       <InstalledApps />
       <StoreApps />
+      <OrphanedLeftovers />
     </div>
   );
 }
