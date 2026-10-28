@@ -1330,6 +1330,23 @@ pub(crate) fn run_elevated_powershell(script: &str, temp_name: &str) -> Result<(
     let tmp = std::env::temp_dir().join(format!("{}_{stamp}_{temp_name}", std::process::id()));
     std::fs::write(&tmp, script).map_err(|e| e.to_string())?;
 
+    // Already administrator ("Run as administrator" is on): run it directly —
+    // no UAC prompt.
+    if crate::elevation::is_elevated() {
+        let status = std::process::Command::new("powershell")
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"])
+            .arg(&tmp)
+            .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+            .status()
+            .map_err(|e| e.to_string());
+        let _ = std::fs::remove_file(&tmp);
+        return match status {
+            Ok(s) if s.success() => Ok(()),
+            Ok(s) => Err(format!("The administrator step failed (exit code {:?}).", s.code())),
+            Err(e) => Err(e),
+        };
+    }
+
     let inner = format!(
         "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden \
          -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','\"{}\"'",
@@ -1824,7 +1841,16 @@ fn ensure_explorer_running() {
         .map(|o| String::from_utf8_lossy(&o.stdout).to_lowercase().contains("explorer.exe"))
         .unwrap_or(true);
     if !running {
-        let _ = std::process::Command::new("explorer.exe").spawn();
+        if crate::elevation::is_elevated() {
+            // Started from an elevated app it would become an elevated
+            // desktop; start it with an ordinary user's rights instead.
+            let _ = std::process::Command::new("runas")
+                .args(["/trustlevel:0x20000", "explorer.exe"])
+                .creation_flags(0x0800_0000)
+                .spawn();
+        } else {
+            let _ = std::process::Command::new("explorer.exe").spawn();
+        }
     }
 }
 
@@ -2176,11 +2202,50 @@ pub fn open_external(url: String) -> Result<(), String> {
     if !(url.starts_with("https://") || url.starts_with("http://")) {
         return Err("Only http(s) URLs can be opened.".into());
     }
-    std::process::Command::new("cmd")
-        .raw_arg(format!("/C start \"\" \"{url}\""))
+    if url.contains('"') {
+        return Err("Invalid URL.".into());
+    }
+    // Handed to Explorer, which passes it to the already-running desktop:
+    // the browser opens with normal rights even when this app runs as
+    // administrator.
+    std::process::Command::new("explorer.exe")
+        .raw_arg(format!("\"{url}\""))
         .spawn()
         .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+#[derive(Debug, Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct AdminStatus {
+    /// This session is running with administrator rights.
+    pub elevated: bool,
+    /// "Run as administrator" is turned on (applies at every launch).
+    pub enabled: bool,
+}
+
+#[tauri::command(async)]
+pub fn admin_status() -> AdminStatus {
+    AdminStatus {
+        elevated: crate::elevation::is_elevated(),
+        enabled: crate::elevation::run_as_admin_enabled(),
+    }
+}
+
+#[tauri::command(async)]
+pub fn set_run_as_admin(enabled: bool) -> Result<(), String> {
+    crate::elevation::set_run_as_admin(enabled)
+}
+
+/// Restarts Storage Doctor with administrator rights now (one UAC prompt).
+#[tauri::command]
+pub fn restart_as_admin(app: AppHandle) -> Result<(), String> {
+    if crate::elevation::relaunch_elevated() {
+        app.exit(0);
+        Ok(())
+    } else {
+        Err("Administrator permission was declined.".into())
+    }
 }
 
 /// Everything inside a folder that is safe to delete (caches, temp, logs…),
@@ -2763,6 +2828,7 @@ mod tests {
         let script = build_force_delete_script(&[path.clone()], false, &report_path);
         let run = run_elevated_powershell(&script, "sd_live_fd.ps1");
         let r = read_force_report(&report_path);
+        println!("ELEVATED_PROCESS={}", crate::elevation::is_elevated());
         println!("RUN={run:?}");
         println!("COMPLETED={}", r.completed);
         println!("EXISTS_AFTER={}", Path::new(&path).exists());

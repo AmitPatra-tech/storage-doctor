@@ -4,6 +4,7 @@ pub mod cleaner;
 mod commands;
 mod db;
 mod dupes;
+mod elevation;
 mod recommendations;
 pub mod scanner;
 mod shell;
@@ -33,7 +34,14 @@ pub fn maybe_run_force_delete_cli() -> bool {
     }
 }
 
+/// Relaunches elevated at startup when "Run as administrator" is on. Returns
+/// true when this process should exit (an elevated copy replaced it).
+pub fn maybe_relaunch_elevated() -> bool {
+    elevation::startup()
+}
+
 pub fn run() {
+    elevation::mark_instance();
     let conn = db::open().expect("failed to open database");
 
     tauri::Builder::default()
@@ -89,6 +97,9 @@ pub fn run() {
             commands::delete_file,
             commands::context_menu_enabled,
             commands::set_context_menu_enabled,
+            commands::admin_status,
+            commands::set_run_as_admin,
+            commands::restart_as_admin,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

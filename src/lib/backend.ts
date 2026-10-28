@@ -719,6 +719,24 @@ export const backend = {
     return getVersion();
   },
 
+  /** Whether this session runs as administrator, and whether "Run as
+   *  administrator" is turned on for every launch. */
+  async adminStatus(): Promise<{ elevated: boolean; enabled: boolean }> {
+    if (!isTauri) return { elevated: false, enabled: false };
+    return invoke("admin_status");
+  },
+
+  async setRunAsAdmin(enabled: boolean): Promise<void> {
+    if (!isTauri) return;
+    return invoke("set_run_as_admin", { enabled });
+  },
+
+  /** Restarts the app with administrator rights now (one UAC prompt). */
+  async restartAsAdmin(): Promise<void> {
+    if (!isTauri) return;
+    return invoke("restart_as_admin");
+  },
+
   /** Whether the right-click entry is currently installed for this user. */
   async contextMenuEnabled(): Promise<boolean> {
     if (!isTauri) return false;

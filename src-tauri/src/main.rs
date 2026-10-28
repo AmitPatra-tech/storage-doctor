@@ -7,5 +7,8 @@ fn main() {
     if storage_doctor_lib::maybe_run_force_delete_cli() {
         return;
     }
+    if storage_doctor_lib::maybe_relaunch_elevated() {
+        return;
+    }
     storage_doctor_lib::run()
 }

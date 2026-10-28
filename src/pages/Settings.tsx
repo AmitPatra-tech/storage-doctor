@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Check, Download, Loader2, Moon, RefreshCw, Sun } from "lucide-react";
+import { Check, Download, Loader2, Moon, RefreshCw, ShieldCheck, Sun } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { useAppUpdate } from "@/hooks/useAppUpdate";
 import {
@@ -68,6 +68,40 @@ export function Settings() {
       setContextMenuBusy(false);
     }
   };
+
+  const { data: admin } = useQuery({ queryKey: ["adminStatus"], queryFn: backend.adminStatus });
+  const [adminBusy, setAdminBusy] = useState(false);
+  const [adminError, setAdminError] = useState<string | null>(null);
+
+  const toggleRunAsAdmin = async () => {
+    setAdminBusy(true);
+    setAdminError(null);
+    try {
+      await backend.setRunAsAdmin(!admin?.enabled);
+      await queryClient.invalidateQueries({ queryKey: ["adminStatus"] });
+    } catch (e) {
+      setAdminError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setAdminBusy(false);
+    }
+  };
+
+  const restartAsAdmin = async () => {
+    setAdminError(null);
+    try {
+      await backend.restartAsAdmin();
+    } catch (e) {
+      setAdminError(e instanceof Error ? e.message : String(e));
+    }
+  };
+
+  const adminDescription = adminError
+    ? adminError
+    : admin?.elevated
+      ? "Running as administrator now: Force Delete and Force Uninstall won't ask for permission this session."
+      : admin?.enabled
+        ? "On — takes effect the next time Storage Doctor starts. Restart now to stop the permission prompts this session."
+        : "Ask for administrator permission once when Storage Doctor starts, instead of every time you Force Delete or Force Uninstall.";
 
   const activateLicense = async () => {
     setLicenseBusy(true);
@@ -153,6 +187,34 @@ export function Settings() {
                   ) : null}
                   {contextMenuOn ? "Added" : "Add to menu"}
                 </Button>
+              }
+            />
+            <div className="border-t border-border" />
+            <SettingRow
+              label="Run as administrator"
+              description={adminDescription}
+              control={
+                <div className="flex gap-1.5">
+                  {admin?.enabled && !admin.elevated && (
+                    <Button size="sm" variant="secondary" onClick={restartAsAdmin}>
+                      <ShieldCheck className="h-3.5 w-3.5" />
+                      Restart now
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    variant={admin?.enabled ? "default" : "secondary"}
+                    disabled={adminBusy}
+                    onClick={toggleRunAsAdmin}
+                  >
+                    {adminBusy ? (
+                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                    ) : admin?.enabled ? (
+                      <Check className="h-3.5 w-3.5" />
+                    ) : null}
+                    {admin?.enabled ? "On" : "Turn on"}
+                  </Button>
+                </div>
               }
             />
           </CardContent>
