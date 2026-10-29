@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { CheckCircle2, Clock, ShieldAlert, Trash2, XCircle, Zap } from "lucide-react";
+import { CheckCircle2, Clock, Loader2, ShieldAlert, Trash2, XCircle, Zap } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
 import { Button } from "@/components/ui/button";
 import { SafetyBadge } from "@/components/ui/badge";
@@ -150,8 +150,9 @@ export function ConfirmDeleteModal({
     setPreviewBusy(true);
     setPreviewError(null);
     try {
-      setPreview(await backend.forceDeletePreview(failed));
-      setApproved(new Set());
+      const found = await backend.forceDeletePreview(failed);
+      setPreview(found);
+      setApproved(new Set(found.flatMap((i) => i.holders.filter((h) => h.closable).map((h) => h.exe))));
       setAttempt("preview");
     } catch (e) {
       setPreviewError(e instanceof Error ? e.message : String(e));
@@ -225,10 +226,10 @@ export function ConfirmDeleteModal({
               <Button variant="danger" size="sm" disabled={busy} onClick={retryForce}>
                 <Zap className="h-3.5 w-3.5" />
                 {busy
-                  ? "Working…"
+                  ? "Force deleting…"
                   : approved.size > 0
-                    ? `Close ${approved.size} program(s) and delete`
-                    : "Delete without closing anything"}
+                    ? `Close ${approved.size} and force delete`
+                    : "Force delete without closing anything"}
               </Button>
             )}
           </>
@@ -315,7 +316,7 @@ export function ConfirmDeleteModal({
               {failed.length} item(s) could not be {verb} even as administrator.{" "}
               {progressNote(freed, permanent)}{" "}
               {allowForce
-                ? "Force Delete first shows you which programs have them open; only the ones you tick are closed."
+                ? "Force Delete shows you everything that has them open (programs, services, a virtual machine or a mounted disk), closes or stops it, then deletes them. You can untick anything you want to keep running."
                 : preview === null
                   ? "They were skipped. Nothing is force-closed for a cache cleanup."
                   : programs.length > 0
@@ -327,6 +328,22 @@ export function ConfirmDeleteModal({
         </>
       )}
 
+      {started && (busy || previewBusy) && (
+        <div className="mb-3 rounded-md border border-primary/30 bg-primary/10 px-3 py-2.5 text-sm">
+          <div className="mb-1.5 flex items-center gap-2 text-primary">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            {previewBusy
+              ? "Checking what is using the items…"
+              : attempt === "preview"
+                ? "Closing what you allowed and force deleting… Stopping a service or virtual machine can take up to a minute."
+                : "Working… Large folders can take a while."}
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-surface-hover">
+            <div className="h-full w-1/3 animate-pulse rounded-full bg-primary" />
+          </div>
+        </div>
+      )}
+
       {attempt === "elevated" && previewError && (
         <p className="mt-2 text-xs text-danger">{previewError}</p>
       )}
@@ -336,8 +353,9 @@ export function ConfirmDeleteModal({
           {closable.length > 0 && (
             <div className="rounded-md border border-warning/40 bg-warning/10 px-3 py-2.5">
               <p className="text-warning">
-                These programs have the items open. Tick the ones that may be closed —
-                unsaved work in them is lost. Unticked programs are left running.
+                To delete these items, the following will be closed or stopped. Unsaved work in
+                them is lost. Untick anything you want to keep running — but an item can't be
+                deleted while something you kept is still using it.
               </p>
               <div className="mt-2 flex flex-col gap-1.5">
                 {closable.map((p) => (

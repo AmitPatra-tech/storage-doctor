@@ -129,7 +129,7 @@ export function LargeFiles() {
         }
       />
 
-      <div className="mb-3 flex items-center gap-3 rounded-md border border-border bg-surface px-4 py-2.5 text-sm">
+      <div className="sticky top-0 z-10 mb-3 flex items-center gap-3 rounded-md border border-border bg-surface px-4 py-2.5 text-sm shadow-md">
         <span>
           {selected.size > 0
             ? `${selected.size} selected · ${formatBytes(

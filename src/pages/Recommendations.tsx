@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { EyeOff, FolderOpen, Trash2 } from "lucide-react";
+import { EyeOff, FolderOpen, Loader2, Trash2 } from "lucide-react";
 import { backend } from "@/lib/backend";
 import { refreshAfterCleanup } from "@/lib/refresh";
 import { formatBytes, removalNotice } from "@/lib/utils";
@@ -15,6 +15,9 @@ export function Recommendations() {
   const queryClient = useQueryClient();
   const [target, setTarget] = useState<Recommendation | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
+  /** The recommendation just cleaned, while every recommendation is being
+   *  re-measured — that takes a while and must be visible. */
+  const [updating, setUpdating] = useState<string | null>(null);
 
   const { data: recommendations, isLoading } = useQuery({
     queryKey: ["recommendations"],
@@ -43,10 +46,16 @@ export function Recommendations() {
 
   const afterDelete = async (bytes: number, remaining: string[]) => {
     setNotice(removalNotice(bytes, true, remaining.length));
+    setUpdating(target?.id ?? null);
     setTarget(null);
-    // Re-measure so cleaned recommendations drop off / update their size.
-    await backend.regenerateRecommendations();
-    refreshAfterCleanup(queryClient);
+    try {
+      // Re-measure so cleaned recommendations drop off / update their size.
+      await backend.regenerateRecommendations();
+      await queryClient.invalidateQueries({ queryKey: ["recommendations"] });
+      refreshAfterCleanup(queryClient);
+    } finally {
+      setUpdating(null);
+    }
   };
 
   return (
@@ -58,6 +67,17 @@ export function Recommendations() {
       {notice && (
         <div className="mb-3 rounded-md border border-success/30 bg-success/10 px-4 py-2.5 text-sm text-success">
           {notice}
+        </div>
+      )}
+      {updating && (
+        <div className="mb-3 rounded-md border border-primary/30 bg-primary/10 px-4 py-2.5 text-sm">
+          <div className="mb-1.5 flex items-center gap-2 text-primary">
+            <Loader2 className="h-4 w-4 animate-spin" />
+            Updating recommendations — re-measuring what is left…
+          </div>
+          <div className="h-1.5 overflow-hidden rounded-full bg-surface-hover">
+            <div className="h-full w-1/3 animate-pulse rounded-full bg-primary" />
+          </div>
         </div>
       )}
       {isLoading && <p className="text-sm text-muted">Loading recommendations…</p>}
@@ -89,10 +109,18 @@ export function Recommendations() {
                 )}
               </div>
               <div className="shrink-0 text-right">
-                <div className="text-sm font-semibold text-success">
-                  {formatBytes(rec.recoverableBytes)}
-                </div>
-                <div className="text-xs text-muted">recoverable</div>
+                {updating === rec.id ? (
+                  <div className="flex items-center gap-1.5 text-xs text-primary">
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" /> Updating…
+                  </div>
+                ) : (
+                  <>
+                    <div className="text-sm font-semibold text-success">
+                      {formatBytes(rec.recoverableBytes)}
+                    </div>
+                    <div className="text-xs text-muted">recoverable</div>
+                  </>
+                )}
               </div>
               <div className="flex shrink-0 items-center gap-1.5">
                 {rec.paths[0] && (
@@ -119,6 +147,7 @@ export function Recommendations() {
                     variant="danger"
                     size="sm"
                     title="Delete permanently to free the space (asks for administrator rights only if needed)"
+                    disabled={updating !== null}
                     onClick={() => setTarget(rec)}
                   >
                     <Trash2 className="h-3.5 w-3.5" />

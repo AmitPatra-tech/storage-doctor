@@ -1356,7 +1356,9 @@ pub(crate) fn run_elevated_powershell(script: &str, temp_name: &str) -> Result<(
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp = std::env::temp_dir().join(format!("{}_{stamp}_{temp_name}", std::process::id()));
-    std::fs::write(&tmp, script).map_err(|e| e.to_string())?;
+    // UTF-8 with a byte-order mark: without one, Windows PowerShell reads the
+    // script as ANSI and any non-English character in a path is mangled.
+    std::fs::write(&tmp, format!("\u{feff}{script}")).map_err(|e| e.to_string())?;
 
     // Already administrator ("Run as administrator" is on): run it directly —
     // no UAC prompt.
@@ -1820,17 +1822,48 @@ pub(crate) fn build_force_delete_script(
 ) -> String {
     let mut script = String::from("Add-Type -AssemblyName Microsoft.VisualBasic\n");
     script.push_str(FORCE_DELETE_HELPER);
+    script.push_str(EXTRA_HOLDERS_PS);
     script.push_str(&protection_setup(std::process::id(), approved));
     script.push_str("$sdOut = New-Object 'System.Collections.Generic.List[string]'\n");
 
     for path in paths {
         let esc = path.replace('\'', "''");
+        // Services / mounted images the user ticked: stop or eject them, then
+        // wait (up to 60 s) for a virtual machine to release its disk.
+        script.push_str(&format!(
+            "if ($null -ne [SDForceDelete]::Approved) {{\n\
+               $sdLs0 = @(); try {{ $sdLs0 = @([SDForceDelete]::GetLockers('{esc}')) }} catch {{ }}\n\
+               $sdStopped = $false\n\
+               foreach ($h in @(Get-SDExtraHolders '{esc}' $sdLs0)) {{\n\
+                 if ([SDForceDelete]::Approved.Contains($h.Key)) {{\n\
+                   try {{ Stop-SDHolder $h; $sdStopped = $true; $sdOut.Add(\"closed`t\" + '{esc}' + \"`t\" + $h.Done) }}\n\
+                   catch {{ $sdOut.Add(\"blocked`t\" + '{esc}' + \"`t\" + $h.Display + ': could not be stopped (' + $_.Exception.Message + ')') }}\n\
+                 }}\n\
+               }}\n\
+               if ($sdStopped) {{ for ($w = 0; $w -lt 60; $w++) {{ if (@(@([SDForceDelete]::GetLockers('{esc}')) | Where-Object {{ $_.Pid -le 4 }}).Count -eq 0) {{ break }}; Start-Sleep -Seconds 1 }} }}\n\
+             }}\n"
+        ));
         script.push_str(&robust_remove_block(&esc, permanent, false));
         script.push_str(&format!(
             "if (Test-Path -LiteralPath '{esc}') {{\n\
                 $sdLeft = @(); try {{ $sdLeft = @([SDForceDelete]::GetLockers('{esc}')) }} catch {{ }}\n\
+                # Held only by Windows itself (a driver) and not a VM disk: a\n\
+                # restart releases it, so deletion is scheduled for then. A VM\n\
+                # disk is re-opened by its VM at startup, so it is reported.\n\
+                $sdOnlySystem = ($sdLeft.Count -gt 0) -and (@($sdLeft | Where-Object {{ $_.Pid -gt 4 }}).Count -eq 0)\n\
+                if ($sdOnlySystem -and -not (Test-SDVmDisk '{esc}')) {{ $sdLeft = @() }}\n\
                 if ($sdLeft.Count -gt 0) {{\n\
-                    foreach ($l in $sdLeft) {{ $sdOut.Add(\"blocked`t\" + '{esc}' + \"`t\" + [SDForceDelete]::Describe($l, $sdClosedExes)) }}\n\
+                    $sdEx2 = @(); try {{ $sdEx2 = @(Get-SDExtraHolders '{esc}' $sdLeft) }} catch {{ }}\n\
+                    $sdKept = @($sdEx2 | Where-Object {{ $null -eq [SDForceDelete]::Approved -or -not [SDForceDelete]::Approved.Contains($_.Key) }})\n\
+                    foreach ($h in $sdKept) {{ $sdOut.Add(\"blocked`t\" + '{esc}' + \"`t\" + ($h.Display -replace ' - .*$', '') + ': you chose to keep it running, and it is still using this item.') }}\n\
+                    $sdKeptVm = @($sdKept | Where-Object {{ $_.Vm }}).Count -gt 0\n\
+                    $sdKeptKeys = @($sdKept | ForEach-Object {{ $_.Key }})\n\
+                    foreach ($l in $sdLeft) {{\n\
+                      if ($l.Pid -le 4 -and $sdKeptVm) {{ continue }}\n\
+                      if ($l.Service -and ($sdKeptKeys -contains ('service:' + $l.Service))) {{ continue }}\n\
+                      if ($l.Exe -eq 'msedgewebview2' -and @($sdKeptKeys | Where-Object {{ $_ -like 'app:*' }}).Count -gt 0) {{ continue }}\n\
+                      $sdOut.Add(\"blocked`t\" + '{esc}' + \"`t\" + [SDForceDelete]::Describe($l, $sdClosedExes))\n\
+                    }}\n\
                 }} else {{\n\
                     $sdR = [SDForceDelete]::ScheduleForReboot('{esc}')\n\
                     if ($sdR -ne 0) {{ $sdOut.Add(\"unschedulable`t\" + '{esc}' + \"`t\" + $sdR) }}\n\
@@ -1846,6 +1879,80 @@ pub(crate) fn build_force_delete_script(
     ));
     script
 }
+
+/// PowerShell (plain, not inside a here-string) that finds holders a process
+/// kill cannot release, each of which Force Delete can offer with consent:
+///   * `service:<name>` — a Windows service Restart Manager reports, or the
+///     service that runs the virtual machine whose disk the item is (matched
+///     by a distinctive word shared by the item's path and the service's
+///     program path, e.g. Claude's "CoworkVMService"). Stopped, not removed.
+///   * `mount:<path>` — a disk image attached (mounted) in Windows; ejected.
+/// Plain ASCII only: the script file is read by Windows PowerShell.
+pub(crate) const EXTRA_HOLDERS_PS: &str = r#"
+$sdNeverStop = @('RpcSs','RpcEptMapper','DcomLaunch','LSM','SamSs','EventLog','Winmgmt','PlugPlay','Power','BFE','mpssvc','WinDefend','SecurityHealthService','wscsvc','CryptSvc','Dhcp','Dnscache','nsi','ProfSvc','UserManager','Schedule','SENS','gpsvc','TrustedInstaller','CoreMessagingRegistrar','BrokerInfrastructure','SystemEventsBroker','StateRepository','AudioEndpointBuilder','Audiosrv','vmcompute','vmms','hns','LanmanServer','LanmanWorkstation','EdgeUpdate','edgeupdatem','CoworkSvcHost')
+function Test-SDVmDisk([string]$p) {
+  if (Test-Path -LiteralPath $p -PathType Leaf) { return ($p -match '\.(vhdx|vhd|avhdx|avhd|vmgs|vmrs|vmcx)$') }
+  if (Test-Path -LiteralPath $p) { try { return [bool]([System.IO.Directory]::EnumerateFiles($p, '*.vhd*', 'AllDirectories') | Select-Object -First 1) } catch { } }
+  return $false
+}
+function Get-SDExtraHolders([string]$p, $lockers) {
+  $out = @()
+  foreach ($l in @($lockers)) {
+    if ($l.Service -and ($sdNeverStop -notcontains $l.Service)) {
+      $svc = Get-Service -Name $l.Service -ErrorAction SilentlyContinue
+      if ($svc -and $svc.Status -eq 'Running') {
+        $out += [pscustomobject]@{ Key = 'service:' + $svc.Name; Display = $svc.DisplayName + ' (Windows service ' + $svc.Name + ') - it will be stopped, not uninstalled'; Done = 'Stopped the service ' + $svc.DisplayName + ' (' + $svc.Name + ')'; Vm = $false }
+      }
+    }
+  }
+  # A WebView2 process holding the item belongs to some app; the engine itself
+  # is never closed, but the app that owns it can be (never Storage Doctor).
+  $sdProcs = $null
+  foreach ($l in @($lockers)) {
+    if ($l.Exe -ne 'msedgewebview2') { continue }
+    if ($null -eq $sdProcs) { $sdProcs = @{}; foreach ($pr in @(Get-CimInstance Win32_Process -Property ProcessId,ParentProcessId,Name -ErrorAction SilentlyContinue)) { $sdProcs[[int]$pr.ProcessId] = $pr } }
+    $cur = $sdProcs[[int]$l.Pid]
+    for ($i = 0; $i -lt 10 -and $null -ne $cur -and $cur.Name -eq 'msedgewebview2.exe'; $i++) { $cur = $sdProcs[[int]$cur.ParentProcessId] }
+    if ($null -ne $cur -and $cur.Name -ne 'msedgewebview2.exe' -and -not [SDForceDelete]::Protected.Contains([int]$cur.ProcessId)) {
+      $hostExe = [System.IO.Path]::GetFileNameWithoutExtension($cur.Name)
+      if ($hostExe -ne 'storage-doctor' -and $hostExe -ne 'explorer') {
+        $out += [pscustomobject]@{ Key = 'app:' + $hostExe; Display = $cur.Name + ' - its WebView2 process is using this; the app will be closed'; Done = 'Closed ' + $cur.Name; Vm = $false }
+      }
+    }
+  }
+  $isVmDisk = Test-SDVmDisk $p
+  if ($isVmDisk) {
+    $imgs = @()
+    if (Test-Path -LiteralPath $p -PathType Leaf) { $imgs = @($p) } else { try { $imgs = @([System.IO.Directory]::EnumerateFiles($p, '*.vhd*', 'AllDirectories') | Select-Object -First 50) } catch { } }
+    foreach ($img in $imgs) {
+      try { $di = Get-DiskImage -ImagePath $img -ErrorAction Stop; if ($di.Attached) { $out += [pscustomobject]@{ Key = 'mount:' + $img; Display = 'Mounted disk image ' + [System.IO.Path]::GetFileName($img) + ' - it will be ejected'; Done = 'Ejected the mounted disk image ' + [System.IO.Path]::GetFileName($img); Vm = $true } } } catch { }
+    }
+    $system = @(@($lockers) | Where-Object { $_.Pid -le 4 }).Count -gt 0
+    if ($system -and @($out | Where-Object { $_.Key -like 'mount:*' }).Count -eq 0) {
+      $generic = @('users','appdata','local','roaming','programdata','program','files','windows','bundle','bundles','cache','microsoft','packages','temp','resources','application', $env:USERNAME.ToLower())
+      $words = @(($p.ToLower() -split '[\\/_\-\. ]+') | Where-Object { $_.Length -ge 5 -and ($generic -notcontains $_) } | Select-Object -Unique)
+      $svcs = @(Get-CimInstance Win32_Service -Filter "State='Running'" -ErrorAction SilentlyContinue | Where-Object { $_.PathName -and ($_.PathName -notlike '*\Windows\*') -and ($sdNeverStop -notcontains $_.Name) })
+      foreach ($s in $svcs) {
+        $pn = $s.PathName.ToLower()
+        if (@($words | Where-Object { $pn.Contains($_) }).Count -gt 0) {
+          $out += [pscustomobject]@{ Key = 'service:' + $s.Name; Display = $s.DisplayName + ' (Windows service ' + $s.Name + ') - runs the virtual machine using this disk; stopping it shuts that virtual machine down'; Done = 'Stopped the service ' + $s.DisplayName + ' (' + $s.Name + '), which shut down its virtual machine'; Vm = $true }
+        }
+      }
+    }
+  }
+  @($out | Sort-Object -Property Key -Unique)
+}
+function Stop-SDHolder($h) {
+  if ($h.Key -like 'service:*') { Stop-Service -Name $h.Key.Substring(8) -Force -ErrorAction Stop }
+  elseif ($h.Key -like 'mount:*') { Dismount-DiskImage -ImagePath $h.Key.Substring(6) -ErrorAction Stop | Out-Null }
+  elseif ($h.Key -like 'app:*') {
+    $n = $h.Key.Substring(4)
+    foreach ($pr in @(Get-Process -Name $n -ErrorAction SilentlyContinue)) {
+      if (-not [SDForceDelete]::Protected.Contains($pr.Id)) { Stop-Process -Id $pr.Id -Force -ErrorAction Stop }
+    }
+  }
+}
+"#;
 
 /// PowerShell run right after `FORCE_DELETE_HELPER`: never close
 /// `protect_pid` (Storage Doctor, or the right-click process) or anything it
@@ -1894,14 +2001,24 @@ pub struct ForcePreviewItem {
 /// `lock\t<path>\t<exe>\t<1|0 closable>\t<display>\t<reason>`, then `done`.
 pub(crate) fn build_force_preview_script(paths: &[String], report: &Path) -> String {
     let mut script = String::from(FORCE_DELETE_HELPER);
+    script.push_str(EXTRA_HOLDERS_PS);
     script.push_str(&protection_setup(std::process::id(), None));
     script.push_str("$sdOut = New-Object 'System.Collections.Generic.List[string]'\n");
     for path in paths {
         let esc = path.replace('\'', "''");
         script.push_str(&format!(
-            "try {{ foreach ($l in @([SDForceDelete]::GetLockers('{esc}'))) {{ \
-               $r = ''; if (-not $l.Closable) {{ $r = [SDForceDelete]::Describe($l, $null) }}; \
-               $sdOut.Add(\"lock`t\" + '{esc}' + \"`t\" + $l.Exe + \"`t\" + [int]$l.Closable + \"`t\" + [SDForceDelete]::DisplayName($l) + \"`t\" + $r) }} }} catch {{ }}\n"
+            "$sdLs = @(); try {{ $sdLs = @([SDForceDelete]::GetLockers('{esc}')) }} catch {{ }}\n\
+             $sdEx = @(); try {{ $sdEx = @(Get-SDExtraHolders '{esc}' $sdLs) }} catch {{ }}\n\
+             $sdExVm = @($sdEx | Where-Object {{ $_.Vm }}).Count -gt 0\n\
+             $sdExKeys = @($sdEx | ForEach-Object {{ $_.Key }})\n\
+             foreach ($l in $sdLs) {{\n\
+               if ($l.Pid -le 4 -and $sdExVm) {{ continue }}\n\
+               if ($l.Exe -eq 'msedgewebview2' -and @($sdExKeys | Where-Object {{ $_ -like 'app:*' }}).Count -gt 0) {{ continue }}\n\
+               if ($l.Service -and ($sdExKeys -contains ('service:' + $l.Service))) {{ continue }}\n\
+               $r = ''; if (-not $l.Closable) {{ $r = [SDForceDelete]::Describe($l, $null) }}\n\
+               $sdOut.Add(\"lock`t\" + '{esc}' + \"`t\" + $l.Exe + \"`t\" + [int]$l.Closable + \"`t\" + [SDForceDelete]::DisplayName($l) + \"`t\" + $r)\n\
+             }}\n\
+             foreach ($h in $sdEx) {{ $sdOut.Add(\"lock`t\" + '{esc}' + \"`t\" + $h.Key + \"`t1`t\" + $h.Display + \"`t\") }}\n"
         ));
     }
     let rf = report.to_string_lossy().replace('\'', "''");
@@ -1951,7 +2068,7 @@ pub(crate) fn force_preview(paths: &[String]) -> Result<Vec<ForcePreviewItem>, S
         .map(|d| d.as_nanos())
         .unwrap_or(0);
     let tmp = std::env::temp_dir().join(format!("{}_{stamp}_sd_preview.ps1", std::process::id()));
-    std::fs::write(&tmp, script).map_err(|e| e.to_string())?;
+    std::fs::write(&tmp, format!("\u{feff}{script}")).map_err(|e| e.to_string())?;
     let _ = std::process::Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File"])
         .arg(&tmp)
@@ -3104,7 +3221,11 @@ mod tests {
     fn live_force_delete() {
         let path = std::env::var("SD_LIVE_PATH").expect("SD_LIVE_PATH");
         let report_path = new_force_report_path();
-        let script = build_force_delete_script(&[path.clone()], false, &report_path, None);
+        // Optional comma-separated approvals (what the user would tick).
+        let approved: Option<Vec<String>> = std::env::var("SD_LIVE_APPROVE")
+            .ok()
+            .map(|v| v.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect());
+        let script = build_force_delete_script(&[path.clone()], false, &report_path, approved.as_deref());
         let run = run_elevated_powershell(&script, "sd_live_fd.ps1");
         let r = read_force_report(&report_path);
         println!("ELEVATED_PROCESS={}", crate::elevation::is_elevated());
@@ -3316,9 +3437,13 @@ mod tests {
     fn force_delete_script_retries_the_delete_and_is_folder_aware() {
         let script = script_for(r"C:\stuck", false);
         assert!(script.contains("for ($i = 0; $i -lt 10; $i++)"));
-        let loop_pos = script.find("for ($i = 0; $i -lt 10").unwrap();
-        let call_pos = script.find("[SDForceDelete]::GetLockers('C:\\stuck')").unwrap();
-        assert!(call_pos > loop_pos, "locker lookup must be inside the retry loop");
+        // Anchor on the retry loop itself ($sdStuck is set right before it);
+        // the same "for" text also appears in the WebView2 owner lookup.
+        let stuck = script.find("$sdStuck = 0").unwrap();
+        let loop_pos = stuck + script[stuck..].find("for ($i = 0; $i -lt 10").unwrap();
+        let loop_end = loop_pos + script[loop_pos..].find("$sdHeld").unwrap();
+        let call_pos = loop_pos + script[loop_pos..].find("[SDForceDelete]::GetLockers('C:\\stuck')").unwrap();
+        assert!(call_pos < loop_end, "locker lookup must be inside the retry loop");
         assert!(script.contains("CollectFilesForRm"));
         assert!(script.contains("ResourcesFor"));
         // Report written and terminated with a completion marker.
@@ -3393,6 +3518,23 @@ mod tests {
         assert!(FORCE_DELETE_HELPER.contains("\"msedgewebview2\""));
         assert!(FORCE_DELETE_HELPER.contains("!Protected.Contains(pid)"));
         assert!(FORCE_DELETE_HELPER.contains("(Approved == null || Approved.Contains(exe))"));
+    }
+
+    #[test]
+    fn extra_holders_are_offered_only_with_consent_and_are_plain_ascii() {
+        assert!(EXTRA_HOLDERS_PS.is_ascii(), "Windows PowerShell reads the script file");
+        let force = build_force_delete_script(&[r"C:\vm\disk.vhdx".to_string()], false, Path::new("C:/r.txt"), Some(&[]));
+        // Services / images are only stopped when the user ticked them.
+        assert!(force.contains("[SDForceDelete]::Approved.Contains($h.Key)"));
+        let stop = force.find("Stop-SDHolder $h;").unwrap();
+        let remove = force.find("[SDForceDelete]::GetLockers('C:\\vm\\disk.vhdx')) }} catch").unwrap_or(0);
+        assert!(stop > 0 && remove >= 0);
+        // Critical services and the Hyper-V host services are never offered.
+        for svc in ["'RpcSs'", "'Winmgmt'", "'vmcompute'", "'vmms'"] {
+            assert!(EXTRA_HOLDERS_PS.contains(svc), "{svc} must be never-stop");
+        }
+        // Never calls wsl.exe (it starts an install prompt when WSL is absent).
+        assert!(!EXTRA_HOLDERS_PS.to_lowercase().contains("wsl"));
     }
 
     #[test]
